@@ -1,0 +1,54 @@
+[package]
+name        = "aerosync-lite"
+version     = "0.1.0"
+edition     = "2021"
+description = "Hyper-lightweight Windows 11 taskbar lyric widget"
+
+[[bin]]
+name = "aerosync-lite"
+path = "src/main.rs"
+
+# ── Release profile: maximise shrink ──────────────────────────────────────────
+[profile.release]
+opt-level     = "z"      # size-optimise (also helps i-cache on a tiny binary)
+lto           = "fat"    # whole-program link-time optimisation
+codegen-units = 1
+panic         = "abort"  # removes unwinding machinery (~30 KB)
+strip         = "symbols"
+
+# ── Dependencies ──────────────────────────────────────────────────────────────
+# Only two: the Windows SDK bindings and nothing else.
+# All HTTP/TLS/WIC/GDI/WinRT come from system DLLs already loaded by Windows.
+[dependencies]
+windows = { version = "0.58", features = [
+    # WinRT / COM init
+    "implement",
+    "Win32_System_Com",
+    "Win32_System_WinRT",
+
+    # Win32 foundation
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",    # GetSystemTimePreciseAsFileTime
+    "Win32_System_Threading",
+
+    # Win32 UI
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Shell",
+    "Win32_UI_HiDpi",
+
+    # Win32 Graphics
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Imaging",            # WIC
+
+    # Win32 Networking
+    "Win32_Networking_WinHttp",
+
+    # WinRT namespaces (no Windows_ prefix in features)
+    "Foundation",
+    "Foundation_Collections",
+    "Media",
+    "Media_Control",
+    "Storage_Streams",
+] }

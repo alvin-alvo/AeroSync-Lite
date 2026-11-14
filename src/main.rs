@@ -10,6 +10,7 @@
 //     lyric line.  On wake, the only critical-path work is UpdateLayeredWindow.
 
 #![windows_subsystem = "windows"]  // No console window
+#![allow(dead_code)]
 
 mod art;
 mod lyrics;
@@ -21,33 +22,29 @@ mod taskbar;
 use windows::{
     core::{w, Result},
     Win32::{
-        Foundation::{HWND, WPARAM, LPARAM, LRESULT, HINSTANCE},
+        Foundation::{HWND, WPARAM, LPARAM, LRESULT, HINSTANCE, POINT},
         System::{
             Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
             Threading::{
                 CreateWaitableTimerExW, SetWaitableTimerEx, CancelWaitableTimer,
-                TIMER_ALL_ACCESS, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
-                MsgWaitForMultipleObjectsEx, MWMO_ALERTABLE, MWMO_INPUTAVAILABLE,
-                QS_ALLINPUT, WAIT_OBJECT_0, WAIT_TIMEOUT, WAIT_FAILED,
+                TIMER_ALL_ACCESS, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
             },
-            SystemInformation::GetSystemTimePreciseAsFileTime,
         },
         UI::{
             WindowsAndMessaging::*,
             HiDpi::SetProcessDpiAwarenessContext,
         },
-        Graphics::Gdi::POINT,
     },
 };
 
 use render::{GdiBitmap, FontCache, widget_width, WIDGET_H, present};
 use state::{
-    AppState, TimeAnchor, TrackData, LyricsPayload,
+    AppState, TrackData, LyricsPayload,
     WM_SMTC_TRACK, WM_SMTC_PLAYBACK, WM_SMTC_TIMELINE,
     WM_LYRICS_READY, WM_SHELL_CHANGED,
 };
 use smtc::SmtcTimelinePayload;
-use taskbar::{OverlayWindow, TaskbarGeometry, DockMode};
+use taskbar::{OverlayWindow, TaskbarGeometry};
 use art::ArtBuffer;
 
 // ── Global state (UI thread only) ─────────────────────────────────────────────
@@ -62,6 +59,7 @@ static mut G_TIMER: windows::Win32::Foundation::HANDLE =
     windows::Win32::Foundation::HANDLE(std::ptr::null_mut());
 // Registered message ID for TaskbarCreated
 static mut G_TASKBAR_CREATED_MSG: u32 = 0;
+static mut G_SHELLHOOK_MSG: u32 = 0;
 // Debounce: lyrics fetch only after metadata is stable (300 ms)
 static mut G_META_DEBOUNCE_GEN: u64 = 0;
 
@@ -111,8 +109,12 @@ fn main() -> Result<()> {
     let overlay = OverlayWindow::create(hinstance, &geo, Some(wnd_proc))?;
     unsafe { G_HWND = overlay.hwnd; }
 
-    // 6. Register TaskbarCreated message so we can re-attach when Explorer restarts
-    unsafe { G_TASKBAR_CREATED_MSG = taskbar::register_taskbar_created(); }
+    // 6. Register TaskbarCreated message and ShellHook
+    unsafe {
+        G_TASKBAR_CREATED_MSG = taskbar::register_taskbar_created();
+        G_SHELLHOOK_MSG = RegisterWindowMessageW(windows::core::w!("SHELLHOOK"));
+        let _ = RegisterShellHookWindow(overlay.hwnd);
+    }
 
     // 7. Init SMTC (blocks briefly on RequestAsync, before message loop)
     smtc::init_smtc(overlay.hwnd)?;
@@ -138,11 +140,19 @@ fn run_message_loop(overlay: &OverlayWindow, timer: &windows::Win32::Foundation:
     let handles = [*timer];
 
     loop {
-        // Sleep until timer fires OR a message arrives — zero CPU while paused
-        let wait = unsafe {
+        let is_playing = {
+            let state = unsafe { &*G_STATE };
+            state.is_playing()
+        };
+
+        // Sleep with 250ms deadline while playing for zero-lag sync and topmost z-order.
+        // Sleep indefinitely while paused (0% CPU).
+        let timeout = if is_playing { 250 } else { INFINITE };
+
+        let _wait = unsafe {
             MsgWaitForMultipleObjectsEx(
-                &handles,
-                INFINITE,
+                Some(&handles),
+                timeout,
                 QS_ALLINPUT,
                 MWMO_ALERTABLE | MWMO_INPUTAVAILABLE,
             )
@@ -154,25 +164,21 @@ fn run_message_loop(overlay: &OverlayWindow, timer: &windows::Win32::Foundation:
             if !got { break; }
             if msg.message == WM_QUIT { return; }
             unsafe {
-                TranslateMessage(&msg);
+                let _ = TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             }
         }
 
-        // If the timer fired, advance lyrics and re-arm
-        if wait == WAIT_OBJECT_0 {
-            on_timer_tick(overlay);
-        }
+        // Advance lyric sync and re-assert topmost z-order
+        check_sync_tick(overlay);
     }
 }
 
-// ── Timer tick (deadline reached = next lyric line is due) ────────────────────
+// ── Sync check (called on timer tick, 250ms periodic wake, or message) ───────
 
-fn on_timer_tick(overlay: &OverlayWindow) {
+fn check_sync_tick(overlay: &OverlayWindow) {
     let state = unsafe { &mut *G_STATE };
-    let fonts = unsafe { &*G_FONTS };
-    let art   = unsafe { &*G_ART };
-    let geo   = unsafe { &*G_GEO };
+    if !state.is_playing() { return; }
 
     let pos_ms = state.position_ms();
 
@@ -180,9 +186,12 @@ fn on_timer_tick(overlay: &OverlayWindow) {
         let new_idx = lyrics.index_at(pos_ms, state.shown_idx);
         if new_idx != state.shown_idx {
             state.shown_idx = new_idx;
+            let fonts = unsafe { &*G_FONTS };
+            let art   = unsafe { &*G_ART };
             refresh_render(state, fonts, art);
             let buf = unsafe { &*G_BUF };
             if let Some(b) = buf.as_ref() {
+                let geo = unsafe { &*G_GEO };
                 let pos = compute_window_pos(geo);
                 present(overlay.hwnd, b, pos);
             }
@@ -190,6 +199,9 @@ fn on_timer_tick(overlay: &OverlayWindow) {
         // Re-arm timer for the NEXT line deadline
         arm_timer_for_next(state);
     }
+
+    // Keep window topmost over the Windows 11 taskbar
+    overlay.raise();
 }
 
 /// Arm the hi-res timer to fire when the next lyric line starts.
@@ -213,10 +225,10 @@ fn arm_timer_for_next(state: &AppState) {
     };
 
     let pos_ms  = state.position_ms();
-    if next_ms <= pos_ms { return; } // Already past
+    let delta_ms = if next_ms > pos_ms { (next_ms - pos_ms).max(1) } else { 1 };
 
-    let due_100ns = -(((next_ms - pos_ms) as i64) * 10_000); // Negative = relative
-    let tolerance_ms = 10i32; // 10 ms tolerance — good enough for lyric sync
+    let due_100ns = -((delta_ms as i64) * 10_000); // Negative = relative
+    let tolerance_ms = 10i32.min(delta_ms as i32);
 
     unsafe {
         SetWaitableTimerEx(
@@ -224,9 +236,9 @@ fn arm_timer_for_next(state: &AppState) {
             &due_100ns as *const i64 as *const _,
             0,          // No period (one-shot)
             None,
-            std::ptr::null_mut(),
             None,
-            tolerance_ms as u32,
+            None,
+            tolerance_ms.max(0) as u32,
         ).ok();
     }
 }
@@ -256,6 +268,26 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             let payload = unsafe { Box::from_raw(wp.0 as *mut LyricsPayload) };
             handle_lyrics_ready(*payload);
             LRESULT(0)
+        }
+        WM_WINDOWPOSCHANGING => {
+            let wp_struct = unsafe { &mut *(lp.0 as *mut WINDOWPOS) };
+            wp_struct.flags &= !SWP_NOZORDER;
+            wp_struct.hwndInsertAfter = HWND_TOPMOST;
+            LRESULT(0)
+        }
+        WM_ACTIVATE => {
+            unsafe {
+                SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                ).ok();
+            }
+            LRESULT(0)
+        }
+        WM_MOUSEACTIVATE => {
+            LRESULT(MA_NOACTIVATE as isize)
         }
         WM_SHELL_CHANGED => {
             handle_shell_changed(hwnd);
@@ -299,6 +331,18 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             // Handle TaskbarCreated (Explorer restart)
             if msg == unsafe { G_TASKBAR_CREATED_MSG } {
                 handle_shell_changed(hwnd);
+                return LRESULT(0);
+            }
+            if msg == unsafe { G_SHELLHOOK_MSG } {
+                unsafe {
+                    SetWindowPos(
+                        hwnd,
+                        HWND_TOPMOST,
+                        0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    ).ok();
+                }
+                return LRESULT(0);
             }
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }
@@ -307,7 +351,7 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
 
 // ── Message handlers (all on UI thread) ───────────────────────────────────────
 
-fn handle_track_change(mut data: TrackData) {
+fn handle_track_change(data: TrackData) {
     let state = unsafe { &mut *G_STATE };
 
     // Filter to browser sessions only (optional — allows all media apps if desired)
@@ -331,19 +375,19 @@ fn handle_track_change(mut data: TrackData) {
     let title      = data.title.clone();
     let artist     = data.artist.clone();
     let album      = data.album.clone();
-    let dur_ms     = state.track.as_ref().map_or(0, |t| t.duration_ms);
-
     // Stash track so timeline handler can fill duration_ms
     state.track = Some(data);
+    let dur_ms  = state.track.as_ref().map_or(0, |t| t.duration_ms);
 
     // Debounce: use a thread that sleeps 300 ms then posts the fetch trigger
+    let hwnd_raw = hwnd.0 as isize;
     std::thread::Builder::new()
         .name("lyric-debounce".into())
         .stack_size(32 * 1024)
         .spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(300));
             // If generation still matches, kick the fetch
-            lyrics::fetch_lyrics_async(hwnd, generation, &title, &artist, &album, dur_ms);
+            lyrics::fetch_lyrics_async(HWND(hwnd_raw as *mut _), generation, &title, &artist, &album, dur_ms);
         })
         .ok();
 
@@ -356,8 +400,14 @@ fn handle_track_change(mut data: TrackData) {
 
 fn handle_playback_change(is_playing: bool, rate: f64) {
     let state = unsafe { &mut *G_STATE };
+    state.is_playing = is_playing;
+    state.playback_rate = rate;
     if let Some(anchor) = &mut state.anchor {
-        // Re-anchor position from SMTC timeline position + now
+        // If transitioning to playing, re-sync last_updated to now to prevent jump
+        if is_playing && !anchor.is_playing {
+            anchor.position_100ns = (anchor.position_ms_now() as i64) * 10_000;
+            anchor.last_updated_100ns = state::precise_filetime_now();
+        }
         anchor.is_playing = is_playing;
         anchor.rate       = rate;
     }
@@ -370,11 +420,16 @@ fn handle_timeline_change(payload: SmtcTimelinePayload) {
 
     let SmtcTimelinePayload { mut anchor, duration_ms } = payload;
 
-    // Carry over play state and rate from previous anchor if we have one
-    if let Some(prev) = &state.anchor {
+    // Carry over play state and rate
+    if state.is_playing {
+        anchor.is_playing = true;
+        anchor.rate       = state.playback_rate;
+    } else if let Some(prev) = &state.anchor {
         anchor.is_playing = prev.is_playing;
         anchor.rate       = prev.rate;
     }
+    state.is_playing = anchor.is_playing;
+    state.playback_rate = anchor.rate;
 
     // Ignore spurious updates within 50 ms of current extrapolated position
     if let Some(prev) = &state.anchor {
@@ -395,6 +450,19 @@ fn handle_timeline_change(payload: SmtcTimelinePayload) {
 
     // After a seek, reset the shown index to force binary search
     state.shown_idx = -1;
+
+    // Update rendered lyric immediately if timeline changed
+    let fonts = unsafe { &*G_FONTS };
+    let art   = unsafe { &*G_ART };
+    let pos_ms = state.position_ms();
+    if let Some(lyrics) = &state.lyrics {
+        let new_idx = lyrics.index_at(pos_ms, -1);
+        if new_idx != state.shown_idx {
+            state.shown_idx = new_idx;
+            refresh_render(state, fonts, art);
+            flush_render(unsafe { G_HWND });
+        }
+    }
 
     arm_timer_for_next(state);
 }
@@ -509,7 +577,7 @@ fn show_context_menu(hwnd: HWND) {
         let mut pt = windows::Win32::Foundation::POINT::default();
         windows::Win32::UI::WindowsAndMessaging::GetCursorPos(&mut pt).ok();
 
-        SetForegroundWindow(hwnd).ok();
+        let _ = SetForegroundWindow(hwnd);
         let cmd = TrackPopupMenu(
             hmenu,
             TPM_RETURNCMD | TPM_RIGHTBUTTON,

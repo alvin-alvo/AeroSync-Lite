@@ -8,10 +8,9 @@
 //   • index_at() uses a sequential pointer (just increment) during normal
 //     playback, and binary search only after seeks.
 
-use windows::Win32::{
-    Foundation::HWND,
-    Networking::WinHttp::*,
-};
+#![allow(dead_code)]
+
+use windows::Win32::Foundation::HWND;
 use windows::core::PCWSTR;
 
 use crate::state::{LyricsPayload, WM_LYRICS_READY};
@@ -194,21 +193,31 @@ fn strip_enhanced_tags(s: &str) -> String {
 // On completion, posts WM_LYRICS_READY to the UI thread.
 
 const USER_AGENT: &str = "AeroSync-Lite/1.0 (https://github.com/aerosync/aerosync-lite)";
+
+// Primary: LRCLIB (lrclib.net)
 const LRCLIB_HOST: &str = "lrclib.net";
 const LRCLIB_PORT: u16  = 443;
 
+// Backup: lrcmux aggregator (api.lrcmux.dev) - fans out to Musixmatch, Apple Music, NetEase, etc.
+const LRCMUX_HOST: &str = "api.lrcmux.dev";
+const LRCMUX_PORT: u16  = 443;
+
 /// Encapsulates a fetch context — lives in a Box for the callback.
 struct FetchCtx {
-    hwnd:        HWND,
+    hwnd_raw:    isize,
     generation:  u64,
-    path:        String,          // e.g. /api/get?...
-    fallback:    Option<String>,  // /api/search?... tried if primary returns 404
+    title:       String,
+    artist:      String,
+    album:       String,
+    duration_ms: u32,
     body:        Vec<u8>,
     status:      u32,
 }
 
-/// Kick off an async LRCLIB lookup.  This returns immediately; the UI thread
-/// receives WM_LYRICS_READY when the fetch completes (or fails).
+/// Kick off an async lyrics lookup with automated multi-tier fallback:
+/// 1. LRCLIB exact get (/api/get)
+/// 2. LRCLIB search (/api/search)
+/// 3. LRCMUX aggregator fallback (/get?title=...&artist=...)
 pub fn fetch_lyrics_async(
     hwnd: HWND,
     generation: u64,
@@ -217,73 +226,80 @@ pub fn fetch_lyrics_async(
     album: &str,
     duration_ms: u32,
 ) {
-    let primary  = build_get_path(title, artist, album, duration_ms);
-    let fallback = build_search_path(title, artist);
-
     let ctx = Box::new(FetchCtx {
-        hwnd,
+        hwnd_raw: hwnd.0 as isize,
         generation,
-        path: primary,
-        fallback: Some(fallback),
+        title: title.to_owned(),
+        artist: artist.to_owned(),
+        album: album.to_owned(),
+        duration_ms,
         body: Vec::new(),
         status: 0,
     });
 
     // Spawn on a thread to keep the WinHTTP flow simple and synchronous.
-    // The thread exits quickly (HTTP + JSON is fast); thread pool picks it up.
     std::thread::Builder::new()
         .name(format!("lyrics-fetch-{generation}"))
-        .stack_size(64 * 1024)   // 64 KB stack is plenty
+        .stack_size(64 * 1024)
         .spawn(move || fetch_thread(ctx))
         .ok();
 }
 
-fn fetch_thread(mut ctx: Box<FetchCtx>) {
-    let result = winhttp_get(LRCLIB_HOST, LRCLIB_PORT, &ctx.path.clone())
-        .and_then(|(status, body)| {
-            ctx.status = status;
-            ctx.body   = body;
-            Ok(())
-        });
+fn fetch_thread(ctx: Box<FetchCtx>) {
+    let mut synced: Option<String> = None;
+    let mut is_instrumental = false;
 
-    // On 404 or error, try fallback search path
-    let use_fallback = result.is_err() || ctx.status == 404;
-
-    if use_fallback {
-        if let Some(fb) = ctx.fallback.take() {
-            if let Ok((status, body)) = winhttp_get(LRCLIB_HOST, LRCLIB_PORT, &fb) {
-                ctx.status = status;
-                ctx.body   = body;
+    // ── Tier 1: LRCLIB /api/get ──────────────────────────────────────────────
+    let lrclib_get_path = build_get_path(&ctx.title, &ctx.artist, &ctx.album, ctx.duration_ms);
+    if let Ok((status, body)) = winhttp_get(LRCLIB_HOST, LRCLIB_PORT, &lrclib_get_path) {
+        if status == 200 && !body.is_empty() {
+            let body_str = String::from_utf8_lossy(&body);
+            if let Some(lrc) = extract_synced_lyrics(&body_str) {
+                synced = Some(lrc);
+            } else if body_str.contains("\"instrumental\":true") {
+                is_instrumental = true;
             }
         }
     }
 
-    if ctx.status != 200 || ctx.body.is_empty() {
-        // No lyrics found — post empty payload so UI can show indicator
-        let payload = Box::new(LyricsPayload {
-            lyrics: LyricSet::default(),
-            generation: ctx.generation,
-        });
-        unsafe {
-            windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-                ctx.hwnd,
-                WM_LYRICS_READY,
-                windows::Win32::Foundation::WPARAM(Box::into_raw(payload) as usize),
-                windows::Win32::Foundation::LPARAM(ctx.generation as isize),
-            ).ok();
+    // ── Tier 2: LRCLIB /api/search (if Tier 1 yielded no synced lyrics) ──────
+    if synced.is_none() && !is_instrumental {
+        let lrclib_search_path = build_search_path(&ctx.title, &ctx.artist);
+        if let Ok((status, body)) = winhttp_get(LRCLIB_HOST, LRCLIB_PORT, &lrclib_search_path) {
+            if status == 200 && !body.is_empty() {
+                let body_str = String::from_utf8_lossy(&body);
+                if let Some(lrc) = extract_synced_lyrics(&body_str) {
+                    synced = Some(lrc);
+                } else if body_str.contains("\"instrumental\":true") {
+                    is_instrumental = true;
+                }
+            }
         }
-        return;
     }
 
-    // Parse JSON response — handle both /api/get (object) and /api/search (array)
-    let body_str = String::from_utf8_lossy(&ctx.body);
-    let synced = extract_synced_lyrics(&body_str);
+    // ── Tier 3: Backup Multi-Source Aggregator (api.lrcmux.dev) ──────────────
+    if synced.is_none() && !is_instrumental {
+        let lrcmux_path = format!(
+            "/get?title={}&artist={}",
+            url_encode(&ctx.title),
+            url_encode(&ctx.artist),
+        );
+        if let Ok((status, body)) = winhttp_get(LRCMUX_HOST, LRCMUX_PORT, &lrcmux_path) {
+            if status == 200 && !body.is_empty() {
+                let body_str = String::from_utf8_lossy(&body);
+                if let Some(lrc) = extract_lrcmux_lines(&body_str) {
+                    synced = Some(lrc);
+                }
+            }
+        }
+    }
+
+    let hwnd = HWND(ctx.hwnd_raw as *mut _);
 
     let lyrics = if let Some(lrc_text) = synced {
         parse_lrc(&lrc_text)
-    } else if body_str.contains("\"instrumental\":true") {
+    } else if is_instrumental {
         let mut ls = LyricSet::default();
-        // Insert a single placeholder line
         let placeholder = "♪ Instrumental";
         ls.text = placeholder.to_owned();
         ls.lines.push(crate::lyrics::LyricLine { start_ms: 0, offset: 0, len: placeholder.len() as u32 });
@@ -299,7 +315,7 @@ fn fetch_thread(mut ctx: Box<FetchCtx>) {
     });
     unsafe {
         windows::Win32::UI::WindowsAndMessaging::PostMessageW(
-            ctx.hwnd,
+            hwnd,
             WM_LYRICS_READY,
             windows::Win32::Foundation::WPARAM(Box::into_raw(payload) as usize),
             windows::Win32::Foundation::LPARAM(ctx.generation as isize),
@@ -321,17 +337,20 @@ fn winhttp_get(host: &str, port: u16, path: &str) -> windows::core::Result<(u32,
         // Session handle
         let hsession = WinHttpOpen(
             PCWSTR(ua_w.as_ptr()),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
             PCWSTR::null(),
             PCWSTR::null(),
             0,
         );
-        if hsession.is_invalid() { return Err(windows::core::Error::from_win32()); }
+        if hsession.is_null() { return Err(windows::core::Error::from_win32()); }
         let _session_guard = HHandleGuard(hsession);
+
+        // Set timeouts: 5s resolve, 5s connect, 5s send, 5s receive
+        WinHttpSetTimeouts(hsession, 5000, 5000, 5000, 5000).ok();
 
         // Connect
         let hconnect = WinHttpConnect(hsession, PCWSTR(host_w.as_ptr()), port, 0);
-        if hconnect.is_invalid() { return Err(windows::core::Error::from_win32()); }
+        if hconnect.is_null() { return Err(windows::core::Error::from_win32()); }
         let _connect_guard = HHandleGuard(hconnect);
 
         // Request (HTTPS)
@@ -344,22 +363,20 @@ fn winhttp_get(host: &str, port: u16, path: &str) -> windows::core::Result<(u32,
             std::ptr::null_mut(),
             WINHTTP_FLAG_SECURE,
         );
-        if hreq.is_invalid() { return Err(windows::core::Error::from_win32()); }
+        if hreq.is_null() { return Err(windows::core::Error::from_win32()); }
         let _req_guard = HHandleGuard(hreq);
 
         // Add Content-Type header
-        let accept_hdr: Vec<u16> = "Accept: application/json\r\n"
-            .encode_utf16().chain(std::iter::once(0)).collect();
+        let accept_hdr: Vec<u16> = "Accept: application/json\r\n".encode_utf16().collect();
         WinHttpAddRequestHeaders(
             hreq,
-            PCWSTR(accept_hdr.as_ptr()),
-            accept_hdr.len() as u32 - 1,
+            &accept_hdr,
             WINHTTP_ADDREQ_FLAG_ADD,
-        ).ok()?;
+        )?;
 
         // Send
-        WinHttpSendRequest(hreq, PCWSTR::null(), 0, std::ptr::null(), 0, 0, 0).ok()?;
-        WinHttpReceiveResponse(hreq, std::ptr::null_mut()).ok()?;
+        WinHttpSendRequest(hreq, None, None, 0, 0, 0)?;
+        WinHttpReceiveResponse(hreq, std::ptr::null_mut())?;
 
         // HTTP status code
         let mut status_code: u32 = 0;
@@ -368,16 +385,16 @@ fn winhttp_get(host: &str, port: u16, path: &str) -> windows::core::Result<(u32,
             hreq,
             WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
             PCWSTR::null(),
-            &mut status_code as *mut u32 as *mut _,
+            Some(&mut status_code as *mut u32 as *mut _),
             &mut buf_size,
             std::ptr::null_mut(),
-        ).ok()?;
+        )?;
 
         // Read body
         let mut body: Vec<u8> = Vec::new();
         loop {
             let mut avail: u32 = 0;
-            WinHttpQueryDataAvailable(hreq, &mut avail).ok()?;
+            WinHttpQueryDataAvailable(hreq, &mut avail)?;
             if avail == 0 { break; }
             let start = body.len();
             body.resize(start + avail as usize, 0u8);
@@ -387,7 +404,7 @@ fn winhttp_get(host: &str, port: u16, path: &str) -> windows::core::Result<(u32,
                 body[start..].as_mut_ptr() as *mut _,
                 avail,
                 &mut read,
-            ).ok()?;
+            )?;
             body.truncate(start + read as usize);
         }
 
@@ -396,10 +413,12 @@ fn winhttp_get(host: &str, port: u16, path: &str) -> windows::core::Result<(u32,
 }
 
 /// RAII guard that calls WinHttpCloseHandle on drop.
-struct HHandleGuard(windows::Win32::Networking::WinHttp::HINTERNET);
+struct HHandleGuard(*mut core::ffi::c_void);
 impl Drop for HHandleGuard {
     fn drop(&mut self) {
-        unsafe { windows::Win32::Networking::WinHttp::WinHttpCloseHandle(self.0); }
+        if !self.0.is_null() {
+            unsafe { let _ = windows::Win32::Networking::WinHttp::WinHttpCloseHandle(self.0); }
+        }
     }
 }
 
@@ -468,7 +487,41 @@ fn extract_synced_lyrics(json: &str) -> Option<String> {
         })
 }
 
-/// Find `"key":"value"` in JSON and return the unescaped value string.
+/// Extract and format lines array from lrcmux JSON response into standard LRC string.
+/// Format: "lines":[{"text":"...","start":30862,"end":37762},...]
+fn extract_lrcmux_lines(json: &str) -> Option<String> {
+    let needle = "\"lines\":";
+    let start_idx = json.find(needle)? + needle.len();
+    let rest = json[start_idx..].trim_start();
+    if !rest.starts_with('[') { return None; }
+
+    let mut lrc_out = String::new();
+    let mut search_str = rest;
+
+    // Scan through items with "text": and "start":
+    while let Some(start_kw) = search_str.find("\"start\":") {
+        let after_start = &search_str[start_kw + 8..];
+        let num_end = after_start.find(|c: char| !c.is_ascii_digit()).unwrap_or(0);
+        let start_ms: u32 = after_start[..num_end].parse().unwrap_or(0);
+
+        // Find associated "text":"..."
+        let text = extract_string_field(search_str, "text").unwrap_or_default();
+
+        let mm = start_ms / 60_000;
+        let ss = (start_ms % 60_000) / 1000;
+        let cs = (start_ms % 1000) / 10;
+        lrc_out.push_str(&format!("[{:02}:{:02}.{:02}]{}\n", mm, ss, cs, text));
+
+        // Advance search past this element
+        if let Some(brace) = search_str[start_kw..].find('}') {
+            search_str = &search_str[start_kw + brace..];
+        } else {
+            break;
+        }
+    }
+
+    if lrc_out.is_empty() { None } else { Some(lrc_out) }
+}
 fn extract_string_field(json: &str, key: &str) -> Option<String> {
     let needle = format!("\"{}\":", key);
     let start  = json.find(&needle)? + needle.len();

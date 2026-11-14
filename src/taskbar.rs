@@ -10,11 +10,11 @@
 //   One-shot UI Automation query on startup and on shell-change events.
 //   Never on a timer.
 
+#![allow(dead_code)]
+
 use windows::Win32::{
     Foundation::{HWND, RECT},
     UI::WindowsAndMessaging::*,
-    UI::Shell::*,
-    Graphics::Gdi::*,
     UI::HiDpi::*,
 };
 
@@ -53,16 +53,14 @@ impl Default for TaskbarGeometry {
 // ── Taskbar handle helpers ────────────────────────────────────────────────────
 
 pub fn find_taskbar() -> Option<HWND> {
-    let hwnd = unsafe { FindWindowW(windows::core::w!("Shell_TrayWnd"), None) };
-    if hwnd.0.is_null() { None } else { Some(hwnd) }
+    unsafe { FindWindowW(windows::core::w!("Shell_TrayWnd"), None).ok() }
 }
 
 pub fn find_tray_notify() -> Option<HWND> {
     let taskbar = find_taskbar()?;
-    let hwnd = unsafe {
-        FindWindowExW(taskbar, None, windows::core::w!("TrayNotifyWnd"), None)
-    };
-    if hwnd.0.is_null() { None } else { Some(hwnd) }
+    unsafe {
+        FindWindowExW(taskbar, None, windows::core::w!("TrayNotifyWnd"), None).ok()
+    }
 }
 
 // ── Geometry measurement ──────────────────────────────────────────────────────
@@ -113,9 +111,12 @@ pub fn measure(config_right_anchor: bool) -> TaskbarGeometry {
 fn icon_cluster_right(taskbar: HWND) -> i32 {
     // Find ReBarWindow32 → find its rightmost extent
     let rebar = unsafe {
-        FindWindowExW(taskbar, None, windows::core::w!("ReBarWindow32"), None)
+        FindWindowExW(taskbar, None, windows::core::w!("ReBarWindow32"), None).ok()
     };
-    if rebar.0.is_null() { return 400; } // Conservative default
+    let rebar = match rebar {
+        Some(h) => h,
+        None => return 400, // Conservative default
+    };
 
     let mut rc = RECT::default();
     unsafe { GetWindowRect(rebar, &mut rc).ok(); }
@@ -124,14 +125,17 @@ fn icon_cluster_right(taskbar: HWND) -> i32 {
 
 fn tray_left_edge(taskbar: HWND) -> i32 {
     let tray = unsafe {
-        FindWindowExW(taskbar, None, windows::core::w!("TrayNotifyWnd"), None)
+        FindWindowExW(taskbar, None, windows::core::w!("TrayNotifyWnd"), None).ok()
     };
-    if tray.0.is_null() {
-        // Fallback: 200 px from right edge of taskbar
-        let mut rc = RECT::default();
-        unsafe { GetWindowRect(taskbar, &mut rc).ok(); }
-        return rc.right - 200;
-    }
+    let tray = match tray {
+        Some(h) => h,
+        None => {
+            // Fallback: 200 px from right edge of taskbar
+            let mut rc = RECT::default();
+            unsafe { GetWindowRect(taskbar, &mut rc).ok(); }
+            return rc.right - 200;
+        }
+    };
     let mut rc = RECT::default();
     unsafe { GetWindowRect(tray, &mut rc).ok(); }
     rc.left
@@ -180,11 +184,11 @@ impl OverlayWindow {
                     x, y, w, h,
                     taskbar,
                     None,
-                    hinstance.into(),
+                    hinstance,
                     None,
                 )
             };
-            if !hwnd.0.is_null() {
+            if let Ok(hwnd) = hwnd {
                 return Ok(OverlayWindow { hwnd, dock_mode: DockMode::Child });
             }
         }
@@ -201,7 +205,7 @@ impl OverlayWindow {
                 x, y, w, h,
                 None,
                 None,
-                hinstance.into(),
+                hinstance,
                 None,
             )
         }?;
@@ -267,15 +271,15 @@ impl OverlayWindow {
     }
 
     pub fn show(&self) {
-        unsafe { ShowWindow(self.hwnd, SW_SHOWNA); }
+        unsafe { let _ = ShowWindow(self.hwnd, SW_SHOWNA); }
     }
 
     pub fn hide(&self) {
-        unsafe { ShowWindow(self.hwnd, SW_HIDE); }
+        unsafe { let _ = ShowWindow(self.hwnd, SW_HIDE); }
     }
 }
 
-fn widget_pos_in_taskbar(geo: &TaskbarGeometry, w: i32, h: i32) -> (i32, i32) {
+fn widget_pos_in_taskbar(geo: &TaskbarGeometry, _w: i32, h: i32) -> (i32, i32) {
     let tb  = &geo.taskbar_rect;
     let fr  = &geo.free_rect;
     let tb_h = tb.bottom - tb.top;

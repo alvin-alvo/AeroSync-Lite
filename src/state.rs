@@ -4,6 +4,8 @@
 // handles, and generation counters. The UI thread is the sole writer; no
 // synchronisation is needed.
 
+#![allow(dead_code)]
+
 use crate::lyrics::LyricSet;
 use crate::render::GdiBitmap;
 
@@ -47,9 +49,7 @@ impl TimeAnchor {
 
 pub fn precise_filetime_now() -> i64 {
     use windows::Win32::System::SystemInformation::GetSystemTimePreciseAsFileTime;
-    use windows::Win32::Foundation::FILETIME;
-    let mut ft = FILETIME::default();
-    unsafe { GetSystemTimePreciseAsFileTime(&mut ft) };
+    let ft = unsafe { GetSystemTimePreciseAsFileTime() };
     ((ft.dwHighDateTime as i64) << 32) | ft.dwLowDateTime as i64
 }
 
@@ -111,6 +111,8 @@ pub struct LyricsPayload {
 
 pub struct AppState {
     pub anchor:       Option<TimeAnchor>,
+    pub is_playing:   bool,
+    pub playback_rate: f64,
     pub track:        Option<TrackData>,
     pub lyrics:       Option<LyricSet>,
     pub shown_idx:    i32,          // index of currently displayed lyric line
@@ -133,6 +135,8 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             anchor:         None,
+            is_playing:     false,
+            playback_rate:  1.0,
             track:          None,
             lyrics:         None,
             shown_idx:      -1,
@@ -152,6 +156,6 @@ impl AppState {
     }
 
     pub fn is_playing(&self) -> bool {
-        self.anchor.as_ref().map_or(false, |a| a.is_playing)
+        self.is_playing || self.anchor.as_ref().map_or(false, |a| a.is_playing)
     }
 }

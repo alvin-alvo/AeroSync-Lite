@@ -10,8 +10,10 @@
 //   • A back buffer is pre-rendered after each present, so at the deadline
 //     the only critical-path work is the UpdateLayeredWindow call itself.
 
+#![allow(dead_code)]
+
 use windows::Win32::{
-    Foundation::{HWND, POINT, SIZE},
+    Foundation::{HWND, POINT, SIZE, COLORREF},
     Graphics::Gdi::*,
     UI::WindowsAndMessaging::*,
 };
@@ -100,8 +102,8 @@ impl GdiBitmap {
 impl Drop for GdiBitmap {
     fn drop(&mut self) {
         unsafe {
-            DeleteDC(self.hdc);
-            DeleteObject(self.hbm);
+            let _ = DeleteDC(self.hdc);
+            let _ = DeleteObject(self.hbm);
         }
     }
 }
@@ -124,24 +126,24 @@ impl FontCache {
 impl Drop for FontCache {
     fn drop(&mut self) {
         unsafe {
-            DeleteObject(self.normal_font);
-            DeleteObject(self.shrunk_font);
+            let _ = DeleteObject(self.normal_font);
+            let _ = DeleteObject(self.shrunk_font);
         }
     }
 }
 
 fn create_font(height: i32) -> windows::core::Result<HFONT> {
     let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
-    let mut lfFaceName = [0u16; 32];
+    let mut lf_face_name = [0u16; 32];
     let copy_len = face.len().min(31);
-    lfFaceName[..copy_len].copy_from_slice(&face[..copy_len]);
+    lf_face_name[..copy_len].copy_from_slice(&face[..copy_len]);
 
     let lf = LOGFONTW {
         lfHeight:         height,
         lfWeight:         FW_REGULAR.0 as i32,
-        lfQuality:        ANTIALIASED_QUALITY.0 as u8,  // Grayscale AA, no ClearType
-        lfCharSet:        DEFAULT_CHARSET.0 as u8,
-        lfFaceName,
+        lfQuality:        FONT_QUALITY(ANTIALIASED_QUALITY.0 as u8),  // Grayscale AA, no ClearType
+        lfCharSet:        FONT_CHARSET(DEFAULT_CHARSET.0 as u8),
+        lfFaceName:       lf_face_name,
         ..Default::default()
     };
     let hf = unsafe { CreateFontIndirectW(&lf) };
@@ -224,7 +226,7 @@ fn render_text(bmp: &GdiBitmap, text: &str, fonts: &FontCache) {
 
         // Draw shadow (dark grey so it shows through the alpha derivation)
         SetTextColor(tmp.hdc, COLORREF(0x00404040));
-        TextOutW(
+        let _ = TextOutW(
             tmp.hdc,
             SHADOW_OFF,
             (text_h - (-FONT_HEIGHT)) / 2 + SHADOW_OFF,
@@ -233,7 +235,7 @@ fn render_text(bmp: &GdiBitmap, text: &str, fonts: &FontCache) {
 
         // Draw primary text (white → luminance = alpha after derivation)
         SetTextColor(tmp.hdc, COLORREF(0x00FFFFFF));
-        TextOutW(
+        let _ = TextOutW(
             tmp.hdc,
             0,
             (text_h - (-FONT_HEIGHT)) / 2,
@@ -276,7 +278,7 @@ fn choose_font(hdc: &HDC, text_w16: &[u16], max_w: i32, fonts: &FontCache) -> HF
     unsafe {
         SelectObject(*hdc, fonts.normal_font);
         let mut sz = SIZE::default();
-        GetTextExtentPoint32W(*hdc, text_w16, &mut sz);
+        let _ = GetTextExtentPoint32W(*hdc, text_w16, &mut sz);
         if sz.cx <= max_w { fonts.normal_font } else { fonts.shrunk_font }
     }
 }

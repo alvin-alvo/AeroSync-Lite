@@ -8,12 +8,9 @@
 //
 // The source stream is freed immediately after decode — no full-res copy lingers.
 
-use windows::{
-    core::Interface,
-    Win32::{
-        Graphics::Imaging::*,
-        System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER, IStream},
-    },
+use windows::Win32::{
+    Graphics::Imaging::*,
+    System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER},
 };
 
 pub const ART_SIZE: u32 = 48;
@@ -32,8 +29,9 @@ impl ArtBuffer {
             let factory: IWICImagingFactory =
                 CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)?;
 
-            // ── 2. Wrap bytes in an IStream ───────────────────────────────
-            let stream = bytes_to_istream(raw)?;
+            // ── 2. Create WIC Stream from memory directly ─────────────────
+            let stream = factory.CreateStream()?;
+            stream.InitializeFromMemory(raw)?;
 
             // ── 3. Decode ─────────────────────────────────────────────────
             let decoder = factory.CreateDecoderFromStream(
@@ -128,26 +126,4 @@ fn inside_rounded_rect(x: i32, y: i32, size: i32, radius: i32) -> bool {
     let dx = x - cx;
     let dy = y - cy;
     dx * dx + dy * dy <= radius * radius
-}
-
-// ── IStream from raw bytes ────────────────────────────────────────────────────
-
-fn bytes_to_istream(data: &[u8]) -> windows::core::Result<IStream> {
-    use windows::Win32::System::Com::*;
-    unsafe {
-        let hglobal = windows::Win32::System::Memory::GlobalAlloc(
-            windows::Win32::System::Memory::GMEM_MOVEABLE,
-            data.len(),
-        )?;
-        let ptr = windows::Win32::System::Memory::GlobalLock(hglobal) as *mut u8;
-        if ptr.is_null() {
-            windows::Win32::System::Memory::GlobalFree(hglobal).ok();
-            return Err(windows::core::Error::from_win32());
-        }
-        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr, data.len());
-        windows::Win32::System::Memory::GlobalUnlock(hglobal);
-
-        let stream = CreateStreamOnHGlobal(hglobal, true)?;
-        Ok(stream)
-    }
 }

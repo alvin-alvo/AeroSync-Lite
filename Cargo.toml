@@ -17,13 +17,13 @@ panic         = "abort"  # removes unwinding machinery (~30 KB)
 strip         = "symbols"
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
-# Only two: the Windows SDK bindings and nothing else.
-# All HTTP/TLS/WIC/GDI/WinRT come from system DLLs already loaded by Windows.
 [dependencies]
 windows = { version = "0.58", features = [
     # WinRT / COM init
     "implement",
+    "Win32_Security",
     "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
     "Win32_System_WinRT",
 
     # Win32 foundation
@@ -45,7 +45,7 @@ windows = { version = "0.58", features = [
     # Win32 Networking
     "Win32_Networking_WinHttp",
 
-    # WinRT namespaces (no Windows_ prefix in features)
+    # WinRT namespaces
     "Foundation",
     "Foundation_Collections",
     "Media",

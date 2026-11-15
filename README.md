@@ -53,7 +53,7 @@ It docks directly in the empty space of your Windows taskbar, presenting the cur
   3. *Tier 3:* Automatic fallback to **LRCMUX** aggregator (`api.lrcmux.dev`).
 - 📌 **Windows 11 Z-Order Pinning:** Employs `RegisterShellHookWindow` activation tracking and `WM_WINDOWPOSCHANGING` enforcement so the widget never disappears behind the taskbar when clicking other applications or Start menu.
 - ⏯️ **Interactive Media Control:** Left-clicking the square album thumbnail instantly toggles Play/Pause.
-- ⏱️ **Bluetooth & Audio Latency Compensation:** Right-click context menu enables adjusting lyric sync offset in real-time in $\pm 100\text{ ms}$ steps.
+- ⏱️ **Bluetooth & Audio Latency Compensation:** Right-click context menu enables adjusting lyric sync offset in real-time in ±100 ms steps.
 
 ---
 

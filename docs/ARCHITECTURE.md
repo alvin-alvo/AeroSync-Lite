@@ -27,7 +27,7 @@ Most desktop lyric widgets and taskbar accessories suffer from severe resource b
 | **Graphics Stack** | Chromium Compositor (~80 MB) | MilCore / D3D (~25 MB) | Direct2D / D3D (~20 MB) | **CPU GDI DIB (~0.2 MB)** |
 | **Window Compositing** | Transparent HWND + GPU blit | Layered window / D3D | DirectComposition surface | **UpdateLayeredWindow (DWM)** |
 | **Media Interception** | WebSockets / Extensions | WinRT projection | WinRT C++/WinRT | **WinRT (Raw Handlers, no async)** |
-| **Networking Stack** | Node `fetch` / libuv | `HttpClient` (libcurl/Schannel) | WinHTTP or libcurl+OpenSSL | **WinHTTP (Zero bundled TLS)** |
+| **Networking Stack** | Node fetch / libuv | HttpClient (Schannel) | WinHTTP or libcurl+OpenSSL | **WinHTTP (Zero bundled TLS)** |
 | **Typical Private RAM** | **180–300 MB** | **40–90 MB** | **15–30 MB** | **~5–7 MB** |
 
 ---
@@ -37,7 +37,7 @@ Most desktop lyric widgets and taskbar accessories suffer from severe resource b
 ```mermaid
 flowchart TD
     subgraph External ["External Media Source"]
-        YTM["YouTube Music / Browser Audio\n(Chrome, Edge, Firefox, Brave)"]
+        YTM["YouTube Music / Browser Audio<br/>(Chrome, Edge, Firefox, Brave)"]
     end
 
     subgraph OS_SMTC ["Windows OS Media Layer"]
@@ -53,24 +53,26 @@ flowchart TD
     end
 
     subgraph NetworkWorker ["Background Worker"]
-        HTTP["Multi-tier WinHTTP Client\nTier 1: LRCLIB /api/get\nTier 2: LRCLIB /api/search\nTier 3: LRCMUX /get (Fallback)"]
+        HTTP["Multi-tier WinHTTP Client<br/>• Tier 1: LRCLIB /api/get<br/>• Tier 2: LRCLIB /api/search<br/>• Tier 3: LRCMUX /get (Fallback)"]
     end
 
     subgraph UI_Thread ["UI Thread (STA Message Loop)"]
         direction TB
-        WND["WNDPROC (AeroSyncLiteOverlay)\n- ShellHook Window Activations\n- WM_WINDOWPOSCHANGING Topmost\n- LBUTTONUP Play/Pause Toggle\n- RBUTTONUP Context Menu"]
-        LOOP["MsgWaitForMultipleObjectsEx\n(Waitable Hi-Res Timer + 250ms playing watchdog)"]
-        STATE["AppState (Single Writer)\n- Generation Tracker\n- Dead-Reckoning Extrapolation\n- Back & Front Buffer Management"]
-        RENDER["Software Text & Art Renderer\n(Segoe UI + Alpha derived from Luminance)"]
+        WND["WNDPROC (AeroSyncLiteOverlay)<br/>• ShellHook Window Activations<br/>• WM_WINDOWPOSCHANGING Topmost<br/>• LBUTTONUP Play/Pause Toggle<br/>• RBUTTONUP Context Menu"]
+        LOOP["MsgWaitForMultipleObjectsEx<br/>(Waitable Hi-Res Timer + 250ms watchdog)"]
+        STATE["AppState (Single Writer)<br/>• Generation Tracker<br/>• Dead-Reckoning Extrapolation<br/>• Back and Front Buffers"]
+        RENDER["Software Text and Art Renderer<br/>(Segoe UI + Alpha from Luminance)"]
         DIB["32-bit ARGB DIB (Memory DC)"]
     end
 
     subgraph DWM_Layer ["Desktop Window Manager"]
-        DWM["UpdateLayeredWindow\n(Per-pixel alpha composition)"]
+        DWM["UpdateLayeredWindow<br/>(Per-pixel alpha composition)"]
     end
 
     YTM -->|OS Audio Event| SMTC
-    SMTC --> E1 & E2 & E3
+    SMTC --> E1
+    SMTC --> E2
+    SMTC --> E3
     E1 -->|PostMessage WM_SMTC_TRACK| WND
     E2 -->|PostMessage WM_SMTC_TIMELINE| WND
     E3 -->|PostMessage WM_SMTC_PLAYBACK| WND
@@ -86,7 +88,7 @@ flowchart TD
     LOOP -->|Deadline elapsed / watchdog| STATE
     STATE -->|Active line change| RENDER
     RENDER -->|Fast blit| DIB
-    DIB -->|Microslice bitmap upload| DWM
+    DIB -->|Bitmap upload| DWM
 ```
 
 ---
@@ -103,11 +105,15 @@ AeroSync-Lite executes strictly on a **single owned UI thread**:
 Windows SMTC does not stream continuous playback position updates. Browser playback engines only push timeline events on state shifts (play, pause, track change, or seek). 
 
 AeroSync-Lite achieves sub-millisecond sync without polling by computing position on demand:
-$$\text{position}(t) = \text{position}_{\text{anchor}} + \left( t_{\text{precise}} - t_{\text{anchor}} \right) \times \text{rate} + \text{offset}_{\text{user}}$$
+
+$$
+\text{position}(t) = \text{position}_{\text{anchor}} + (t_{\text{precise}} - t_{\text{anchor}}) \times \text{rate} + \text{offset}_{\text{user}}
+$$
 
 Where:
-- $t_{\text{precise}}$ is read from `GetSystemTimePreciseAsFileTime` (wall-clock 100 ns FILETIME).
-- $t_{\text{anchor}}$ is `TimelineProperties.LastUpdatedTime` (also wall-clock FILETIME).
+- `t_precise` is read from `GetSystemTimePreciseAsFileTime` (wall-clock 100 ns FILETIME).
+- `t_anchor` is `TimelineProperties.LastUpdatedTime` (also wall-clock FILETIME).
+- `rate` is the playback speed (typically `1.0`).
 - Using matching wall-clock epochs prevents drift between QueryPerformanceCounter (QPC) and system wall-clock time.
 
 ### 4.3. Deadline-Scheduled Wakeup Loop
@@ -115,7 +121,11 @@ Instead of running a 60 Hz animation loop or a 100 ms polling timer:
 1. `index_at(pos)` determines the current lyric line.
 2. `next_start_ms(idx)` computes the timestamp of the next line.
 3. A Windows high-resolution waitable timer (`CreateWaitableTimerExW` with `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) is armed for the exact remaining duration:
-   $$\Delta t = \text{next\_line\_start} - \text{position}(t)$$
+
+$$
+\Delta t = \text{next\_line\_start} - \text{position}(t)
+$$
+
 4. The thread enters kernel sleep via `MsgWaitForMultipleObjectsEx`:
    - **While Playing:** Arms deadline timer with a 250 ms maximum sleep watchdog to guarantee prompt re-syncing and taskbar Z-order enforcement.
    - **While Paused:** Cancels all timers and sleeps with `INFINITE` timeout. CPU utilization is literally **0.00%**.
@@ -125,8 +135,13 @@ Direct2D and Direct3D require initializing DirectX runtimes, allocating GPU comm
 
 AeroSync-Lite uses CPU-rendered GDI into a 32-bit ARGB DIB:
 - **Subpixel Antialiasing Simulation:** GDI standard text rendering (`DrawTextW`) does not natively write alpha channels. AeroSync-Lite renders light text onto a black background with grayscale smoothing.
-- **Luminance Pass:** Pixel alpha is derived directly from luminance ($\alpha = \text{channel}_R$).
-- **Premultiplication:** RGB values are premultiplied by the derived alpha channel in a single vectorized SIMD/compiler-optimized pass.
+- **Luminance Pass:** Pixel alpha is derived directly from luminance (`alpha = R_channel`).
+- **Premultiplication:** RGB values are premultiplied by the derived alpha channel in a single vectorized pass:
+
+$$
+\text{pixel}_{RGB} = \frac{\text{pixel}_{RGB} \times \alpha}{255}
+$$
+
 - **Zero Copy DWM Presentation:** `UpdateLayeredWindow` passes the premultiplied DIB directly to the Windows Desktop Window Manager. DWM handles GPU composition at screen refresh rate.
 
 ### 4.5. Windows 11 Taskbar Docking & Z-Order Persistence
@@ -142,5 +157,5 @@ AeroSync-Lite solves this via an autonomous floating topmost architecture:
 ### 4.6. Multi-Tier Resilient Lyric Sourcing
 Lyrics are parsed from synchronized LRC formats using a multi-tiered fallback strategy:
 1. **Tier 1 (LRCLIB Exact):** Queries `https://lrclib.net/api/get` with track title, artist name, album name, and duration.
-2. **Tier 2 (LRCLIB Fuzzy Search):** If exact lookup returns 404/502, queries `https://lrclib.net/api/search?q=...` and selects the best duration match ($\pm 4$ seconds).
+2. **Tier 2 (LRCLIB Fuzzy Search):** If exact lookup returns 404/502, queries `https://lrclib.net/api/search?q=...` and selects the best duration match (within ±4 seconds).
 3. **Tier 3 (LRCMUX Aggregator Fallback):** If LRCLIB is unavailable, automatically falls back to `https://api.lrcmux.dev/get` with title and artist parameters.

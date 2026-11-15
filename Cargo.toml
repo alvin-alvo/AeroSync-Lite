@@ -3,6 +3,8 @@ name        = "aerosync-lite"
 version     = "0.1.0"
 edition     = "2021"
 description = "Hyper-lightweight Windows 11 taskbar lyric widget"
+repository  = "https://github.com/alvin-alvo/AeroSync-Lite"
+license     = "GPL-3.0"
 
 [[bin]]
 name = "aerosync-lite"

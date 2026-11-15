@@ -107,11 +107,11 @@ Windows SMTC does not stream continuous playback position updates. Browser playb
 AeroSync-Lite achieves sub-millisecond sync without polling by computing position on demand:
 
 $$
-\text{position}(t) = \text{position}_{\text{anchor}} + (t_{\text{precise}} - t_{\text{anchor}}) \times \text{rate} + \text{offset}_{\text{user}}
+\text{pos}(t) = \text{pos}_{\text{anchor}} + (t_{\text{now}} - t_{\text{anchor}}) \times \text{rate} + \text{offset}
 $$
 
 Where:
-- `t_precise` is read from `GetSystemTimePreciseAsFileTime` (wall-clock 100 ns FILETIME).
+- `t_now` is read from `GetSystemTimePreciseAsFileTime` (wall-clock 100 ns FILETIME).
 - `t_anchor` is `TimelineProperties.LastUpdatedTime` (also wall-clock FILETIME).
 - `rate` is the playback speed (typically `1.0`).
 - Using matching wall-clock epochs prevents drift between QueryPerformanceCounter (QPC) and system wall-clock time.
@@ -123,7 +123,7 @@ Instead of running a 60 Hz animation loop or a 100 ms polling timer:
 3. A Windows high-resolution waitable timer (`CreateWaitableTimerExW` with `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) is armed for the exact remaining duration:
 
 $$
-\Delta t = \text{next\_line\_start} - \text{position}(t)
+\Delta t = t_{\text{next}} - \text{pos}(t)
 $$
 
 4. The thread enters kernel sleep via `MsgWaitForMultipleObjectsEx`:
@@ -139,7 +139,7 @@ AeroSync-Lite uses CPU-rendered GDI into a 32-bit ARGB DIB:
 - **Premultiplication:** RGB values are premultiplied by the derived alpha channel in a single vectorized pass:
 
 $$
-\text{pixel}_{RGB} = \frac{\text{pixel}_{RGB} \times \alpha}{255}
+\text{RGB}_{\text{premult}} = \frac{\text{RGB} \times \alpha}{255}
 $$
 
 - **Zero Copy DWM Presentation:** `UpdateLayeredWindow` passes the premultiplied DIB directly to the Windows Desktop Window Manager. DWM handles GPU composition at screen refresh rate.

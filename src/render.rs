@@ -13,12 +13,13 @@
 #![allow(dead_code)]
 
 use windows::Win32::{
-    Foundation::{HWND, POINT, SIZE, COLORREF},
+    Foundation::{HWND, POINT, SIZE, COLORREF, RECT},
     Graphics::Gdi::*,
     UI::WindowsAndMessaging::*,
 };
 
 use crate::art::{ArtBuffer, ART_SIZE};
+use crate::theme::Palette;
 
 // ── Layout constants ──────────────────────────────────────────────────────────
 
@@ -28,6 +29,42 @@ pub const TEXT_PAD_Y:   i32 = 2;       // Vertical padding inside text area
 pub const TEXT_AREA_W:  i32 = 480;     // Max text columns
 pub const FONT_HEIGHT:  i32 = -14;     // lfHeight (negative = character height, not cell)
 pub const SHADOW_OFF:   i32 = 1;       // Drop-shadow pixel offset
+
+// ── Multi-script classification ───────────────────────────────────────────────
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum Script {
+    Latin = 0,
+    Indic = 1,
+    Thai = 2,
+    Han = 3,
+    Kana = 4,
+    Hangul = 5,
+}
+
+const FACES: [&str; 6] = [
+    "Segoe UI",           // Latin, Cyrillic, Greek, Arabic, Hebrew
+    "Nirmala UI",         // Devanagari, Malayalam (0D00-0D7F), Tamil, Telugu, Kannada, Bengali, Gurmukhi, Sinhala
+    "Leelawadee UI",      // Thai, Lao, Khmer
+    "Microsoft YaHei UI", // Simplified Chinese
+    "Yu Gothic UI",       // Japanese Kana & Kanji
+    "Malgun Gothic",      // Korean Hangul
+];
+
+pub fn classify_script(s: &str) -> Script {
+    for c in s.chars() {
+        match c as u32 {
+            0x0900..=0x0DFF => return Script::Indic,
+            0x0E00..=0x0E7F => return Script::Thai,
+            0x3040..=0x30FF => return Script::Kana,
+            0xAC00..=0xD7AF => return Script::Hangul,
+            0x3400..=0x4DBF | 0x4E00..=0x9FFF => return Script::Han,
+            _ => {}
+        }
+    }
+    Script::Latin
+}
 
 // ── GdiBitmap ─────────────────────────────────────────────────────────────────
 
@@ -111,37 +148,50 @@ impl Drop for GdiBitmap {
 // ── Font cache ────────────────────────────────────────────────────────────────
 
 pub struct FontCache {
-    pub normal_font:  HFONT,
-    pub shrunk_font:  HFONT,  // For long lines
+    height: i32,
+    fonts: [(Option<HFONT>, Option<HFONT>); 6],
 }
 
 impl FontCache {
     pub fn create() -> windows::core::Result<Self> {
-        let normal_font = create_font(FONT_HEIGHT)?;
-        let shrunk_font = create_font((FONT_HEIGHT as f32 * 0.85) as i32)?;
-        Ok(FontCache { normal_font, shrunk_font })
+        Ok(FontCache {
+            height: FONT_HEIGHT,
+            fonts: [
+                (None, None), (None, None), (None, None),
+                (None, None), (None, None), (None, None),
+            ],
+        })
+    }
+
+    pub fn get(&mut self, script: Script, shrunk: bool) -> HFONT {
+        let idx = script as usize;
+        let slot = if shrunk { &mut self.fonts[idx].1 } else { &mut self.fonts[idx].0 };
+        *slot.get_or_insert_with(|| {
+            let h = if shrunk { (self.height as f32 * 0.85) as i32 } else { self.height };
+            create_font(FACES[idx], h).unwrap_or_else(|_| create_font("Segoe UI", h).unwrap())
+        })
     }
 }
 
 impl Drop for FontCache {
     fn drop(&mut self) {
-        unsafe {
-            let _ = DeleteObject(self.normal_font);
-            let _ = DeleteObject(self.shrunk_font);
+        for (f1, f2) in &mut self.fonts {
+            if let Some(h) = f1.take() { unsafe { let _ = DeleteObject(h); } }
+            if let Some(h) = f2.take() { unsafe { let _ = DeleteObject(h); } }
         }
     }
 }
 
-fn create_font(height: i32) -> windows::core::Result<HFONT> {
-    let face: Vec<u16> = "Segoe UI\0".encode_utf16().collect();
+fn create_font(face_name: &str, height: i32) -> windows::core::Result<HFONT> {
+    let face: Vec<u16> = face_name.encode_utf16().chain(std::iter::once(0)).collect();
     let mut lf_face_name = [0u16; 32];
     let copy_len = face.len().min(31);
     lf_face_name[..copy_len].copy_from_slice(&face[..copy_len]);
 
     let lf = LOGFONTW {
         lfHeight:         height,
-        lfWeight:         FW_REGULAR.0 as i32,
-        lfQuality:        FONT_QUALITY(ANTIALIASED_QUALITY.0 as u8),  // Grayscale AA, no ClearType
+        lfWeight:         FW_SEMIBOLD.0 as i32,
+        lfQuality:        FONT_QUALITY(ANTIALIASED_QUALITY.0 as u8),  // Grayscale AA, not ClearType
         lfCharSet:        FONT_CHARSET(DEFAULT_CHARSET.0 as u8),
         lfFaceName:       lf_face_name,
         ..Default::default()
@@ -165,7 +215,8 @@ pub fn render_frame(
     bmp:      &GdiBitmap,
     art_buf:  Option<&ArtBuffer>,
     lyric:    &str,
-    fonts:    &FontCache,
+    fonts:    &mut FontCache,
+    palette:  &Palette,
 ) {
     bmp.clear();
 
@@ -178,7 +229,7 @@ pub fn render_frame(
 
     // ── Lyric text ────────────────────────────────────────────────────────────
     if !lyric.is_empty() {
-        render_text(bmp, lyric, fonts);
+        render_text(bmp, lyric, fonts, palette);
     }
 }
 
@@ -202,9 +253,8 @@ fn blit_art(bmp: &GdiBitmap, art: &ArtBuffer) {
     }
 }
 
-/// Render lyric text with a 1 px drop shadow using GDI into a temporary
-/// black-background strip, then derive alpha from luminance and blit into `bmp`.
-fn render_text(bmp: &GdiBitmap, text: &str, fonts: &FontCache) {
+/// Render lyric text with contrast halo and per-script font shaping.
+fn render_text(bmp: &GdiBitmap, text: &str, fonts: &mut FontCache, palette: &Palette) {
     let text_x = ART_SIZE as i32 + TEXT_PAD_X;
     let text_w  = TEXT_AREA_W;
     let text_h  = WIDGET_H;
@@ -216,70 +266,71 @@ fn render_text(bmp: &GdiBitmap, text: &str, fonts: &FontCache) {
     };
     tmp.clear(); // All black (R=G=B=0, A=0)
 
-    // Choose font based on text width
-    let text_w16: Vec<u16> = text.encode_utf16().collect();
-    let font = choose_font(&tmp.hdc, &text_w16, text_w - SHADOW_OFF, fonts);
+    let script = classify_script(text);
+    let mut text_w16: Vec<u16> = text.encode_utf16().collect();
+
+    // Measure text with normal font first
+    let normal_font = fonts.get(script, false);
+    let mut sz = SIZE::default();
+    unsafe {
+        SelectObject(tmp.hdc, normal_font);
+        let _ = GetTextExtentPoint32W(tmp.hdc, &text_w16, &mut sz);
+    }
+
+    let is_shrunk = sz.cx > (text_w - SHADOW_OFF);
+    let font = if is_shrunk { fonts.get(script, true) } else { normal_font };
 
     unsafe {
         SelectObject(tmp.hdc, font);
         SetBkMode(tmp.hdc, TRANSPARENT);
+        SetTextColor(tmp.hdc, COLORREF(0x00FFFFFF)); // White glyphs = coverage mask
 
-        // Draw shadow (dark grey so it shows through the alpha derivation)
-        SetTextColor(tmp.hdc, COLORREF(0x00404040));
-        let _ = TextOutW(
+        let mut rc = RECT {
+            left: 0,
+            top: 0,
+            right: text_w - SHADOW_OFF,
+            bottom: text_h,
+        };
+        DrawTextW(
             tmp.hdc,
-            SHADOW_OFF,
-            (text_h - (-FONT_HEIGHT)) / 2 + SHADOW_OFF,
-            &text_w16,
-        );
-
-        // Draw primary text (white → luminance = alpha after derivation)
-        SetTextColor(tmp.hdc, COLORREF(0x00FFFFFF));
-        let _ = TextOutW(
-            tmp.hdc,
-            0,
-            (text_h - (-FONT_HEIGHT)) / 2,
-            &text_w16,
+            &mut text_w16,
+            &mut rc,
+            DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS | DT_VCENTER,
         );
     }
 
-    // Derive alpha from R channel (white text: R = luminance = desired alpha)
-    // Then blit into the main bitmap at offset (text_x, 0).
-    let n_pixels = (text_w * text_h) as usize;
-    for i in 0..n_pixels {
-        let raw = unsafe { *tmp.pixels.add(i) };
-        let r = (raw >> 16) as u8;
-        let g = (raw >> 8)  as u8;
-        let b = raw         as u8;
+    // Compose using coverage mask + contrast halo
+    for y in 0..text_h {
+        for x in 0..text_w {
+            let i = (y * text_w + x) as usize;
+            let raw = unsafe { *tmp.pixels.add(i) };
+            let c = (raw & 0xFF) as u32; // Luminance
 
-        // Alpha from max channel (handles both grey shadow and white text)
-        let alpha = r.max(g).max(b);
-        if alpha == 0 { continue; } // Transparent pixel — skip
+            // 1-px down-right halo
+            let hc = if x > 0 && y > 0 {
+                let prev_raw = unsafe { *tmp.pixels.add(i - text_w as usize - 1) };
+                (prev_raw & 0xFF) as u32 * palette.halo_a as u32 / 255
+            } else {
+                0
+            };
+            let hc = hc * (255 - c) / 255;
+            let a = c + hc;
+            if a == 0 { continue; }
 
-        // Premultiply
-        let pr = (r as u32 * alpha as u32 / 255) as u8;
-        let pg = (g as u32 * alpha as u32 / 255) as u8;
-        let pb = (b as u32 * alpha as u32 / 255) as u8;
+            let ch = |f: u8, o: u8| (f as u32 * c + o as u32 * hc) / 255;
+            let pr = ch(palette.fg[0], palette.halo[0]);
+            let pg = ch(palette.fg[1], palette.halo[1]);
+            let pb = ch(palette.fg[2], palette.halo[2]);
 
-        let src_x  = i as i32 % text_w;
-        let src_y  = i as i32 / text_w;
-        let dst_x  = text_x + src_x;
-        let dst_y  = src_y;
-        if dst_x >= bmp.width || dst_y >= bmp.height { continue; }
-        let dst_idx = (dst_y * bmp.width + dst_x) as usize;
-        unsafe {
-            *bmp.pixels.add(dst_idx) =
-                ((alpha as u32) << 24) | ((pr as u32) << 16) | ((pg as u32) << 8) | pb as u32;
+            let dst_x = text_x + x;
+            let dst_y = y;
+            if dst_x >= bmp.width || dst_y >= bmp.height { continue; }
+            let dst_idx = (dst_y * bmp.width + dst_x) as usize;
+            unsafe {
+                *bmp.pixels.add(dst_idx) =
+                    (a << 24) | (pr << 16) | (pg << 8) | pb;
+            }
         }
-    }
-}
-
-fn choose_font(hdc: &HDC, text_w16: &[u16], max_w: i32, fonts: &FontCache) -> HFONT {
-    unsafe {
-        SelectObject(*hdc, fonts.normal_font);
-        let mut sz = SIZE::default();
-        let _ = GetTextExtentPoint32W(*hdc, text_w16, &mut sz);
-        if sz.cx <= max_w { fonts.normal_font } else { fonts.shrunk_font }
     }
 }
 

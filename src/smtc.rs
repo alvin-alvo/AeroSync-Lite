@@ -288,11 +288,103 @@ fn fetch_thumbnail_bytes(thumb_ref: &IRandomAccessStreamReference) -> Result<Vec
 
 /// Box `data`, convert to raw pointer, PostMessage as WPARAM.
 /// The UI thread must receive it and call Box::from_raw.
+/// Frees the Box if PostMessage fails to prevent memory leaks.
 fn post_boxed<T: 'static>(hwnd: HWND, msg: u32, data: T) {
-    let ptr = Box::into_raw(Box::new(data)) as usize;
+    let ptr = Box::into_raw(Box::new(data));
     unsafe {
-        PostMessageW(hwnd, msg, WPARAM(ptr), LPARAM(0)).ok();
+        if PostMessageW(hwnd, msg, WPARAM(ptr as usize), LPARAM(0)).is_err() {
+            drop(Box::from_raw(ptr));
+        }
     }
+}
+
+// ── Background album art retry ────────────────────────────────────────────────
+
+pub fn fetch_current_art_blocking(expected_title: &str) -> crate::state::ArtResult {
+    use crate::state::ArtResult;
+    use crate::art::ArtBuffer;
+
+    let manager = match MediaManager::RequestAsync().and_then(|op| {
+        let event = unsafe { CreateEventW(None, true, false, None)? };
+        let ev_raw = event.0 as isize;
+        op.SetCompleted(&windows::Foundation::AsyncOperationCompletedHandler::new(
+            move |_, _| {
+                unsafe { SetEvent(HANDLE(ev_raw as *mut _)).ok(); }
+                Ok(())
+            }
+        ))?;
+        unsafe { WaitForSingleObject(event, 2000); }
+        op.GetResults()
+    }) {
+        Ok(m) => m,
+        Err(_) => return ArtResult::Missing,
+    };
+
+    let session = match manager.GetCurrentSession() {
+        Ok(s) => s,
+        Err(_) => return ArtResult::Missing,
+    };
+
+    let props = match session.TryGetMediaPropertiesAsync().and_then(|op| {
+        let event = unsafe { CreateEventW(None, true, false, None)? };
+        let ev_raw = event.0 as isize;
+        op.SetCompleted(&windows::Foundation::AsyncOperationCompletedHandler::new(
+            move |_, _| {
+                unsafe { SetEvent(HANDLE(ev_raw as *mut _)).ok(); }
+                Ok(())
+            }
+        ))?;
+        unsafe { WaitForSingleObject(event, 2000); }
+        op.GetResults()
+    }) {
+        Ok(p) => p,
+        Err(_) => return ArtResult::Missing,
+    };
+
+    let title = props.Title().unwrap_or_default().to_string();
+    if !expected_title.is_empty() && title != expected_title {
+        return ArtResult::Missing;
+    }
+
+    let thumb_ref = match props.Thumbnail() {
+        Ok(t) => t,
+        Err(_) => return ArtResult::Missing,
+    };
+
+    let bytes = match fetch_thumbnail_bytes(&thumb_ref) {
+        Ok(b) if !b.is_empty() => b,
+        _ => return ArtResult::Missing,
+    };
+
+    match ArtBuffer::from_bytes(&bytes) {
+        Ok(buf) => {
+            let hash = buf.hash();
+            ArtResult::Ok { title, hash, buffer: buf }
+        }
+        Err(_) => ArtResult::Missing,
+    }
+}
+
+pub fn spawn_art_retry(hwnd: HWND, gen: u32, expected_title: String) {
+    let raw = hwnd.0 as isize;
+    std::thread::Builder::new()
+        .name("art-retry".into())
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            let res = fetch_current_art_blocking(&expected_title);
+            let ptr = Box::into_raw(Box::new(res));
+            unsafe {
+                if PostMessageW(
+                    HWND(raw as *mut _),
+                    crate::state::WM_ART_READY,
+                    WPARAM(gen as usize),
+                    LPARAM(ptr as isize),
+                ).is_err() {
+                    drop(Box::from_raw(ptr));
+                }
+            }
+        })
+        .ok();
 }
 
 // ── Toggle play/pause (fire and forget) ───────────────────────────────────────

@@ -18,34 +18,43 @@ mod render;
 mod smtc;
 mod state;
 mod taskbar;
+mod theme;
 
 use windows::{
     core::{w, Result},
     Win32::{
-        Foundation::{HWND, WPARAM, LPARAM, LRESULT, HINSTANCE, POINT},
+        Foundation::{HWND, WPARAM, LPARAM, LRESULT, HINSTANCE, POINT, WAIT_OBJECT_0},
         System::{
             Com::{CoInitializeEx, COINIT_APARTMENTTHREADED},
             Threading::{
                 CreateWaitableTimerExW, SetWaitableTimerEx, CancelWaitableTimer,
                 TIMER_ALL_ACCESS, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, INFINITE,
+                GetCurrentProcess, SetProcessInformation, ProcessPowerThrottling,
+                PROCESS_POWER_THROTTLING_STATE, PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+                PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
             },
         },
         UI::{
             WindowsAndMessaging::*,
             HiDpi::SetProcessDpiAwarenessContext,
+            Accessibility::{
+                SetWinEventHook, HWINEVENTHOOK,
+            },
         },
     },
 };
 
 use render::{GdiBitmap, FontCache, widget_width, WIDGET_H, present};
 use state::{
-    AppState, TrackData, LyricsPayload,
+    AppState, TrackData, LyricsPayload, ArtResult,
     WM_SMTC_TRACK, WM_SMTC_PLAYBACK, WM_SMTC_TIMELINE,
-    WM_LYRICS_READY, WM_SHELL_CHANGED,
+    WM_LYRICS_READY, WM_SHELL_CHANGED, WM_ART_READY,
+    TIMER_ART, TIMER_THEME, ART_BACKOFF_MS,
 };
 use smtc::SmtcTimelinePayload;
 use taskbar::{OverlayWindow, TaskbarGeometry};
 use art::ArtBuffer;
+use theme::Palette;
 
 // ── Global state (UI thread only) ─────────────────────────────────────────────
 
@@ -53,15 +62,33 @@ static mut G_HWND:  HWND           = HWND(std::ptr::null_mut());
 static mut G_STATE: *mut AppState  = std::ptr::null_mut();
 static mut G_FONTS: *mut FontCache = std::ptr::null_mut();
 static mut G_GEO:   *mut TaskbarGeometry = std::ptr::null_mut();
-static mut G_ART:   *mut Option<ArtBuffer> = std::ptr::null_mut();
 static mut G_BUF:   *mut Option<GdiBitmap> = std::ptr::null_mut();
 static mut G_TIMER: windows::Win32::Foundation::HANDLE =
     windows::Win32::Foundation::HANDLE(std::ptr::null_mut());
 // Registered message ID for TaskbarCreated
 static mut G_TASKBAR_CREATED_MSG: u32 = 0;
 static mut G_SHELLHOOK_MSG: u32 = 0;
-// Debounce: lyrics fetch only after metadata is stable (300 ms)
-static mut G_META_DEBOUNCE_GEN: u64 = 0;
+static mut G_WINEVENT_HOOK: HWINEVENTHOOK = HWINEVENTHOOK(std::ptr::null_mut());
+
+unsafe extern "system" fn winevent_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    _hwnd: HWND,
+    _id_object: i32,
+    _id_child: i32,
+    _id_event_thread: u32,
+    _dwms_event_time: u32,
+) {
+    if event == EVENT_SYSTEM_FOREGROUND && !G_HWND.0.is_null() {
+        // Re-assert topmost when foreground changes (zero polling required)
+        SetWindowPos(
+            G_HWND,
+            HWND_TOPMOST,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        ).ok();
+    }
+}
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -73,25 +100,38 @@ fn main() -> Result<()> {
         ).ok();
     }
 
-    // 2. COM / WinRT on the main (STA) thread
+    // 2. Opt out of Windows 11 timer-resolution throttling for background tasks
+    let power_throttling = PROCESS_POWER_THROTTLING_STATE {
+        Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+        ControlMask: PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION,
+        StateMask: 0, // 0 = do NOT ignore -> honor our timer resolution
+    };
+    unsafe {
+        let _ = SetProcessInformation(
+            GetCurrentProcess(),
+            ProcessPowerThrottling,
+            &power_throttling as *const _ as *const _,
+            std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32,
+        );
+    }
+
+    // 3. COM / WinRT on the main (STA) thread
     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?; }
 
-    // 3. Allocate owned state on the heap (we pass raw pointers to the WNDPROC)
+    // 4. Allocate owned state on the heap (we pass raw pointers to the WNDPROC)
     let mut state    = Box::new(AppState::new());
     let mut fonts    = Box::new(FontCache::create()?);
     let mut geo      = Box::new(TaskbarGeometry::default());
-    let mut art_slot = Box::new(Option::<ArtBuffer>::None);
     let mut buf_slot = Box::new(Option::<GdiBitmap>::None);
 
     unsafe {
         G_STATE = Box::as_mut(&mut state)   as *mut _;
         G_FONTS = Box::as_mut(&mut fonts)   as *mut _;
         G_GEO   = Box::as_mut(&mut geo)     as *mut _;
-        G_ART   = Box::as_mut(&mut art_slot) as *mut _;
         G_BUF   = Box::as_mut(&mut buf_slot) as *mut _;
     }
 
-    // 4. Create high-resolution waitable timer
+    // 5. Create high-resolution waitable timer
     let timer = unsafe {
         CreateWaitableTimerExW(
             None,
@@ -102,32 +142,43 @@ fn main() -> Result<()> {
     };
     unsafe { G_TIMER = timer; }
 
-    // 5. Measure taskbar and create the overlay window
+    // 6. Measure taskbar and create the overlay window
     let hinstance: HINSTANCE = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?.into() };
     *geo = taskbar::measure(true /* right anchor */);
 
     let overlay = OverlayWindow::create(hinstance, &geo, Some(wnd_proc))?;
     unsafe { G_HWND = overlay.hwnd; }
 
-    // 6. Register TaskbarCreated message and ShellHook
+    // 7. Register TaskbarCreated message, ShellHook, and WinEvent hook
     unsafe {
         G_TASKBAR_CREATED_MSG = taskbar::register_taskbar_created();
         G_SHELLHOOK_MSG = RegisterWindowMessageW(windows::core::w!("SHELLHOOK"));
         let _ = RegisterShellHookWindow(overlay.hwnd);
+
+        let hook = SetWinEventHook(
+            EVENT_SYSTEM_FOREGROUND,
+            EVENT_SYSTEM_FOREGROUND,
+            None,
+            Some(winevent_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+        G_WINEVENT_HOOK = hook;
     }
 
-    // 7. Init SMTC (blocks briefly on RequestAsync, before message loop)
+    // 8. Init SMTC (blocks briefly on RequestAsync, before message loop)
     smtc::init_smtc(overlay.hwnd)?;
 
-    // 8. Initial blank render
-    refresh_render(&state, &fonts, &art_slot);
+    // 9. Initial blank render
+    refresh_render(&state, &mut fonts);
     if let Some(buf) = buf_slot.as_ref() {
         let pos = compute_window_pos(&geo);
         present(overlay.hwnd, buf, pos);
     }
     overlay.show();
 
-    // 9. Message loop — the heart of the system
+    // 10. Message loop — true event-driven, zero polling
     run_message_loop(&overlay, &timer);
 
     Ok(())
@@ -140,19 +191,12 @@ fn run_message_loop(overlay: &OverlayWindow, timer: &windows::Win32::Foundation:
     let handles = [*timer];
 
     loop {
-        let is_playing = {
-            let state = unsafe { &*G_STATE };
-            state.is_playing()
-        };
-
-        // Sleep with 250ms deadline while playing for zero-lag sync and topmost z-order.
-        // Sleep indefinitely while paused (0% CPU).
-        let timeout = if is_playing { 250 } else { INFINITE };
-
-        let _wait = unsafe {
+        // Sleep until waitable timer fires at lyric deadline OR a window message arrives.
+        // Zero polling watchdog. Sleeps with INFINITE timeout (0% CPU while paused).
+        let wait = unsafe {
             MsgWaitForMultipleObjectsEx(
                 Some(&handles),
-                timeout,
+                INFINITE,
                 QS_ALLINPUT,
                 MWMO_ALERTABLE | MWMO_INPUTAVAILABLE,
             )
@@ -169,16 +213,25 @@ fn run_message_loop(overlay: &OverlayWindow, timer: &windows::Win32::Foundation:
             }
         }
 
-        // Advance lyric sync and re-assert topmost z-order
-        check_sync_tick(overlay);
+        // Check if deadline timer fired or if extrapolated position passed the next line
+        let state = unsafe { &*G_STATE };
+        let is_due = state.is_playing()
+            && state.lyrics.as_ref()
+                .and_then(|l| l.next_start_ms(state.shown_idx))
+                .map_or(false, |next| state.position_ms() >= next);
+
+        if wait == WAIT_OBJECT_0 || is_due {
+            on_timer_tick(overlay);
+        }
     }
 }
 
-// ── Sync check (called on timer tick, 250ms periodic wake, or message) ───────
+// ── Timer tick (deadline reached = next lyric line is due) ────────────────────
 
-fn check_sync_tick(overlay: &OverlayWindow) {
+fn on_timer_tick(overlay: &OverlayWindow) {
     let state = unsafe { &mut *G_STATE };
-    if !state.is_playing() { return; }
+    let fonts = unsafe { &mut *G_FONTS };
+    let geo   = unsafe { &*G_GEO };
 
     let pos_ms = state.position_ms();
 
@@ -186,12 +239,9 @@ fn check_sync_tick(overlay: &OverlayWindow) {
         let new_idx = lyrics.index_at(pos_ms, state.shown_idx);
         if new_idx != state.shown_idx {
             state.shown_idx = new_idx;
-            let fonts = unsafe { &*G_FONTS };
-            let art   = unsafe { &*G_ART };
-            refresh_render(state, fonts, art);
+            refresh_render(state, fonts);
             let buf = unsafe { &*G_BUF };
             if let Some(b) = buf.as_ref() {
-                let geo = unsafe { &*G_GEO };
                 let pos = compute_window_pos(geo);
                 present(overlay.hwnd, b, pos);
             }
@@ -199,9 +249,6 @@ fn check_sync_tick(overlay: &OverlayWindow) {
         // Re-arm timer for the NEXT line deadline
         arm_timer_for_next(state);
     }
-
-    // Keep window topmost over the Windows 11 taskbar
-    overlay.raise();
 }
 
 /// Arm the hi-res timer to fire when the next lyric line starts.
@@ -269,6 +316,23 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
             handle_lyrics_ready(*payload);
             LRESULT(0)
         }
+        WM_ART_READY => {
+            let gen = wp.0 as u32;
+            let payload = unsafe { Box::from_raw(lp.0 as *mut ArtResult) };
+            handle_art_ready(hwnd, gen, *payload);
+            LRESULT(0)
+        }
+        WM_TIMER => {
+            let timer_id = wp.0;
+            if timer_id == TIMER_ART {
+                unsafe { KillTimer(hwnd, TIMER_ART).ok(); }
+                handle_art_timer(hwnd);
+            } else if timer_id == TIMER_THEME {
+                unsafe { KillTimer(hwnd, TIMER_THEME).ok(); }
+                handle_theme_change(hwnd);
+            }
+            LRESULT(0)
+        }
         WM_WINDOWPOSCHANGING => {
             let wp_struct = unsafe { &mut *(lp.0 as *mut WINDOWPOS) };
             wp_struct.flags &= !SWP_NOZORDER;
@@ -317,7 +381,24 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
         }
 
         // ── Settings/display change ───────────────────────────────────────
-        WM_SETTINGCHANGE | WM_DISPLAYCHANGE => {
+        WM_SETTINGCHANGE => {
+            if lp.0 != 0 {
+                let ptr = lp.0 as *const u16;
+                let s = unsafe {
+                    let mut len = 0;
+                    while *ptr.add(len) != 0 { len += 1; }
+                    std::slice::from_raw_parts(ptr, len)
+                };
+                if let Ok(setting) = String::from_utf16(s) {
+                    if setting == "ImmersiveColorSet" {
+                        unsafe { SetTimer(hwnd, TIMER_THEME, 120, None); }
+                    }
+                }
+            }
+            unsafe { PostMessageW(hwnd, WM_SHELL_CHANGED, WPARAM(0), LPARAM(0)).ok(); }
+            LRESULT(0)
+        }
+        WM_DISPLAYCHANGE => {
             unsafe { PostMessageW(hwnd, WM_SHELL_CHANGED, WPARAM(0), LPARAM(0)).ok(); }
             LRESULT(0)
         }
@@ -353,9 +434,8 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRE
 
 fn handle_track_change(data: TrackData) {
     let state = unsafe { &mut *G_STATE };
-
-    // Filter to browser sessions only (optional — allows all media apps if desired)
-    // if !data.is_browser_session() { return; }
+    let fonts = unsafe { &mut *G_FONTS };
+    let hwnd  = unsafe { G_HWND };
 
     let key = data.key();
     if key == state.last_track_key { return; } // Duplicate event from multiple SMTC fires
@@ -364,18 +444,35 @@ fn handle_track_change(data: TrackData) {
     state.shown_idx   = -1;
     state.lyrics      = None;
 
-    // Update art
-    let art = unsafe { &mut *G_ART };
-    *art = data.art_bytes.as_deref().and_then(|b| ArtBuffer::from_bytes(b).ok());
+    // Increment art generation & reset backoff
+    state.art_state.gen = state.art_state.gen.wrapping_add(1);
+    state.art_state.attempt = 0;
+    let cur_gen = state.art_state.gen;
+    unsafe { KillTimer(hwnd, TIMER_ART).ok(); }
+
+    // If art bytes provided directly, decode and store if new
+    if let Some(bytes) = &data.art_bytes {
+        if let Ok(buf) = ArtBuffer::from_bytes(bytes) {
+            let hash = buf.hash();
+            if hash != state.art_state.good_hash {
+                state.art_state.prev_hash = state.art_state.good_hash;
+                state.art_state.good_hash = hash;
+                state.art_state.good = Some(buf);
+            }
+        } else {
+            let title = data.title.clone();
+            smtc::spawn_art_retry(hwnd, cur_gen, title);
+        }
+    } else {
+        let title = data.title.clone();
+        smtc::spawn_art_retry(hwnd, cur_gen, title);
+    }
 
     // Store duration for lyrics fetch (may arrive before timeline event)
-    // Schedule debounced lyrics fetch (300 ms)
-    let hwnd       = unsafe { G_HWND };
     let generation = state.generation;
     let title      = data.title.clone();
     let artist     = data.artist.clone();
     let album      = data.album.clone();
-    // Stash track so timeline handler can fill duration_ms
     state.track = Some(data);
     let dur_ms  = state.track.as_ref().map_or(0, |t| t.duration_ms);
 
@@ -386,16 +483,60 @@ fn handle_track_change(data: TrackData) {
         .stack_size(32 * 1024)
         .spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(300));
-            // If generation still matches, kick the fetch
             lyrics::fetch_lyrics_async(HWND(hwnd_raw as *mut _), generation, &title, &artist, &album, dur_ms);
         })
         .ok();
 
     // Render immediately with art + "Loading…" text
-    let fonts = unsafe { &*G_FONTS };
-    let art   = unsafe { &*G_ART };
-    refresh_render(state, fonts, art);
+    refresh_render(state, fonts);
     flush_render(hwnd);
+}
+
+fn handle_art_ready(hwnd: HWND, gen: u32, res: ArtResult) {
+    let state = unsafe { &mut *G_STATE };
+    let fonts = unsafe { &mut *G_FONTS };
+    if gen != state.art_state.gen {
+        return; // Stale result from previous track
+    }
+    match res {
+        ArtResult::Ok { title, hash, buffer } => {
+            if state.track.as_ref().map_or(false, |t| t.title == title) {
+                state.art_state.prev_hash = state.art_state.good_hash;
+                state.art_state.good_hash = hash;
+                state.art_state.good = Some(buffer);
+                refresh_render(state, fonts);
+                flush_render(hwnd);
+            }
+        }
+        ArtResult::Missing => {
+            let attempt = state.art_state.attempt as usize;
+            if attempt < ART_BACKOFF_MS.len() {
+                let delay = ART_BACKOFF_MS[attempt];
+                state.art_state.attempt += 1;
+                unsafe {
+                    SetTimer(hwnd, TIMER_ART, delay, None);
+                }
+            }
+        }
+    }
+}
+
+fn handle_art_timer(hwnd: HWND) {
+    let state = unsafe { &*G_STATE };
+    let title = state.track.as_ref().map_or(String::new(), |t| t.title.clone());
+    smtc::spawn_art_retry(hwnd, state.art_state.gen, title);
+}
+
+fn handle_theme_change(hwnd: HWND) {
+    let state = unsafe { &mut *G_STATE };
+    let fonts = unsafe { &mut *G_FONTS };
+    let light = theme::system_uses_light_theme();
+    if state.light_theme != light {
+        state.light_theme = light;
+        state.palette = Palette::for_theme(light);
+        refresh_render(state, fonts);
+        flush_render(hwnd);
+    }
 }
 
 fn handle_playback_change(is_playing: bool, rate: f64) {
@@ -417,6 +558,7 @@ fn handle_playback_change(is_playing: bool, rate: f64) {
 
 fn handle_timeline_change(payload: SmtcTimelinePayload) {
     let state = unsafe { &mut *G_STATE };
+    let fonts = unsafe { &mut *G_FONTS };
 
     let SmtcTimelinePayload { mut anchor, duration_ms } = payload;
 
@@ -452,14 +594,12 @@ fn handle_timeline_change(payload: SmtcTimelinePayload) {
     state.shown_idx = -1;
 
     // Update rendered lyric immediately if timeline changed
-    let fonts = unsafe { &*G_FONTS };
-    let art   = unsafe { &*G_ART };
     let pos_ms = state.position_ms();
     if let Some(lyrics) = &state.lyrics {
         let new_idx = lyrics.index_at(pos_ms, -1);
         if new_idx != state.shown_idx {
             state.shown_idx = new_idx;
-            refresh_render(state, fonts, art);
+            refresh_render(state, fonts);
             flush_render(unsafe { G_HWND });
         }
     }
@@ -469,6 +609,7 @@ fn handle_timeline_change(payload: SmtcTimelinePayload) {
 
 fn handle_lyrics_ready(payload: LyricsPayload) {
     let state = unsafe { &mut *G_STATE };
+    let fonts = unsafe { &mut *G_FONTS };
 
     // Drop stale responses
     if payload.generation != state.generation { return; }
@@ -482,9 +623,7 @@ fn handle_lyrics_ready(payload: LyricsPayload) {
         state.shown_idx = lyrics.index_at(pos_ms, -1);
     }
 
-    let fonts = unsafe { &*G_FONTS };
-    let art   = unsafe { &*G_ART };
-    refresh_render(state, fonts, art);
+    refresh_render(state, fonts);
     flush_render(unsafe { G_HWND });
     arm_timer_for_next(state);
 }
@@ -507,7 +646,7 @@ fn handle_shell_changed(hwnd: HWND) {
 
 // ── Render helpers ────────────────────────────────────────────────────────────
 
-fn refresh_render(state: &AppState, fonts: &FontCache, art: &Option<ArtBuffer>) {
+fn refresh_render(state: &AppState, fonts: &mut FontCache) {
     let buf_slot = unsafe { &mut *G_BUF };
 
     let w = widget_width();
@@ -533,7 +672,7 @@ fn refresh_render(state: &AppState, fonts: &FontCache, art: &Option<ArtBuffer>) 
         }
     };
 
-    render::render_frame(buf, art.as_ref(), &lyric_text, fonts);
+    render::render_frame(buf, state.art_state.good.as_ref(), &lyric_text, fonts, &state.palette);
 }
 
 fn flush_render(hwnd: HWND) {

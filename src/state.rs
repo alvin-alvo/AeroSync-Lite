@@ -8,6 +8,8 @@
 
 use crate::lyrics::LyricSet;
 use crate::render::GdiBitmap;
+use crate::art::ArtBuffer;
+use crate::theme::{Palette, system_uses_light_theme};
 
 // ── Custom WM_APP message IDs ─────────────────────────────────────────────────
 // Cross-thread messages from WinRT / WinHTTP callbacks → UI thread.
@@ -16,6 +18,27 @@ pub const WM_SMTC_PLAYBACK: u32 = 0x8002; // wparam = 1 (playing) | 0 (paused/st
 pub const WM_SMTC_TIMELINE: u32 = 0x8003; // wparam = Box<TimeAnchor> as usize
 pub const WM_LYRICS_READY:  u32 = 0x8004; // wparam = Box<LyricsPayload> as usize, lparam = generation
 pub const WM_SHELL_CHANGED: u32 = 0x8005; // re-probe taskbar geometry
+pub const WM_ART_READY:     u32 = 0x8006; // wparam = gen as usize, lparam = Box<ArtResult> as usize
+
+pub const TIMER_ART:   usize = 0xA27;
+pub const TIMER_THEME: usize = 0xA28;
+pub const ART_BACKOFF_MS: [u32; 4] = [400, 1000, 2500, 6000];
+
+// ── Art fetch state ───────────────────────────────────────────────────────────
+
+#[derive(Default)]
+pub struct ArtState {
+    pub gen:       u32,
+    pub attempt:   u8,
+    pub good:      Option<ArtBuffer>, // last validated cover (never cleared prematurely)
+    pub good_hash: u64,
+    pub prev_hash: u64,
+}
+
+pub enum ArtResult {
+    Ok { title: String, hash: u64, buffer: ArtBuffer },
+    Missing,
+}
 
 // ── Playback anchor ───────────────────────────────────────────────────────────
 
@@ -129,10 +152,18 @@ pub struct AppState {
 
     /// Whether the widget window is currently visible.
     pub visible:      bool,
+
+    /// Theme palette and contrast state.
+    pub palette:      Palette,
+    pub light_theme:  bool,
+
+    /// Robust album art retry state.
+    pub art_state:    ArtState,
 }
 
 impl AppState {
     pub fn new() -> Self {
+        let light = system_uses_light_theme();
         Self {
             anchor:         None,
             is_playing:     false,
@@ -146,6 +177,9 @@ impl AppState {
             front_buf:      None,
             offset_ms:      0,
             visible:        false,
+            palette:        Palette::for_theme(light),
+            light_theme:    light,
+            art_state:      ArtState::default(),
         }
     }
 

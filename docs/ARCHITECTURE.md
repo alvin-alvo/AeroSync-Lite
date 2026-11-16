@@ -58,10 +58,10 @@ flowchart TD
 
     subgraph UI_Thread ["UI Thread (STA Message Loop)"]
         direction TB
-        WND["WNDPROC (AeroSyncLiteOverlay)<br/>• ShellHook Window Activations<br/>• WM_WINDOWPOSCHANGING Topmost<br/>• LBUTTONUP Play/Pause Toggle<br/>• RBUTTONUP Context Menu"]
-        LOOP["MsgWaitForMultipleObjectsEx<br/>(Waitable Hi-Res Timer + 250ms watchdog)"]
+        WND["WNDPROC (AeroSyncLiteOverlay)<br/>• ShellHook & WinEvent Foreground Hook<br/>• WM_WINDOWPOSCHANGING Topmost<br/>• LBUTTONUP Play/Pause Toggle<br/>• RBUTTONUP Context Menu"]
+        LOOP["MsgWaitForMultipleObjectsEx<br/>(Waitable Hi-Res Timer, Zero Watchdog Polling)"]
         STATE["AppState (Single Writer)<br/>• Generation Tracker<br/>• Dead-Reckoning Extrapolation<br/>• Back and Front Buffers"]
-        RENDER["Software Text and Art Renderer<br/>(Segoe UI + Alpha from Luminance)"]
+        RENDER["Software Text and Art Renderer<br/>• Multi-Script Font Fallback<br/>• Contrast Halo & Theme Palette"]
         DIB["32-bit ARGB DIB (Memory DC)"]
     end
 
@@ -84,8 +84,8 @@ flowchart TD
     STATE -->|300ms metadata debounce| HTTP
     HTTP -->|PostMessage WM_LYRICS_READY| WND
 
-    STATE -->|Arm relative deadline| LOOP
-    LOOP -->|Deadline elapsed / watchdog| STATE
+    STATE -->|Arm exact line deadline| LOOP
+    LOOP -->|Deadline elapsed / message arrival| STATE
     STATE -->|Active line change| RENDER
     RENDER -->|Fast blit| DIB
     DIB -->|Bitmap upload| DWM
@@ -98,7 +98,7 @@ flowchart TD
 ### 4.1. Single-Threaded UI & Concurrency Model
 AeroSync-Lite executes strictly on a **single owned UI thread**:
 - **Zero Locks / No Mutexes:** `AppState` is solely accessed by the UI thread inside the message loop.
-- **Thread Pool Callbacks:** SMTC WinRT events (`MediaPropertiesChanged`, `PlaybackInfoChanged`, `TimelinePropertiesChanged`) fire on MTA thread-pool threads. Handlers immediately snapshot primitive data onto the heap, wrap it in a pointer, and dispatch via `PostMessageW` (`WM_SMTC_*`). The thread pool thread exits immediately.
+- **Thread Pool Callbacks:** SMTC WinRT events (`MediaPropertiesChanged`, `PlaybackInfoChanged`, `TimelinePropertiesChanged`) fire on MTA thread-pool threads. Handlers immediately snapshot primitive data onto the heap, wrap it in a pointer, and dispatch via `PostMessageW` (`WM_SMTC_*`). If `PostMessageW` fails, the allocation is freed immediately to prevent heap leakage.
 - **Network Isolation:** WinHTTP queries run in isolated background threads and report back via `WM_LYRICS_READY` carrying an incrementing generation counter. Stale network responses from skipped tracks are dropped instantaneously without locking.
 
 ### 4.2. Zero-Polling Sync Engine (Dead-Reckoning)
@@ -111,13 +111,13 @@ $$
 $$
 
 Where:
-- `t_now` is read from `GetSystemTimePreciseAsFileTime` (wall-clock 100 ns FILETIME).
-- `t_anchor` is `TimelineProperties.LastUpdatedTime` (also wall-clock FILETIME).
-- `rate` is the playback speed (typically `1.0`).
+- $t_{\text{now}}$ is read from `GetSystemTimePreciseAsFileTime` (wall-clock 100 ns FILETIME).
+- $t_{\text{anchor}}$ is `TimelineProperties.LastUpdatedTime` (also wall-clock FILETIME).
+- $\text{rate}$ is the playback speed (typically `1.0`).
 - Using matching wall-clock epochs prevents drift between QueryPerformanceCounter (QPC) and system wall-clock time.
 
-### 4.3. Deadline-Scheduled Wakeup Loop
-Instead of running a 60 Hz animation loop or a 100 ms polling timer:
+### 4.3. True Zero-Polling Deadline Loop
+Instead of running a polling timer or watchdog:
 1. `index_at(pos)` determines the current lyric line.
 2. `next_start_ms(idx)` computes the timestamp of the next line.
 3. A Windows high-resolution waitable timer (`CreateWaitableTimerExW` with `CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`) is armed for the exact remaining duration:
@@ -127,32 +127,33 @@ $$
 $$
 
 4. The thread enters kernel sleep via `MsgWaitForMultipleObjectsEx`:
-   - **While Playing:** Arms deadline timer with a 250 ms maximum sleep watchdog to guarantee prompt re-syncing and taskbar Z-order enforcement.
-   - **While Paused:** Cancels all timers and sleeps with `INFINITE` timeout. CPU utilization is literally **0.00%**.
+   - **While Playing:** Sleeps directly until the next line is due (wakeups drop from continuous polling to ~0.25/s).
+   - **While Paused:** Cancels all timers and sleeps with `INFINITE` timeout (strictly **0.00% CPU**).
+   - **Timer Throttling Opt-Out:** Uses `SetProcessInformation(ProcessPowerThrottling)` with `PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION` so Windows 11 background power management honors high-resolution lyric deadlines.
 
-### 4.4. Software CPU Rendering & Alpha-from-Luminance
-Direct2D and Direct3D require initializing DirectX runtimes, allocating GPU command queues, and mapping device contexts. For a ~400×40 pixel taskbar strip, this overhead is counterproductive.
+### 4.4. Software CPU Rendering & Multi-Script Typography
+Direct2D and Direct3D require initializing DirectX runtimes, allocating GPU command queues, and mapping device contexts. For a ~400×48 pixel taskbar strip, this overhead is counterproductive.
 
 AeroSync-Lite uses CPU-rendered GDI into a 32-bit ARGB DIB:
-- **Subpixel Antialiasing Simulation:** GDI standard text rendering (`DrawTextW`) does not natively write alpha channels. AeroSync-Lite renders light text onto a black background with grayscale smoothing.
-- **Luminance Pass:** Pixel alpha is derived directly from luminance (`alpha = R_channel`).
-- **Premultiplication:** RGB values are premultiplied by the derived alpha channel in a single vectorized pass:
-
-$$
-\text{RGB}_{\text{premult}} = \frac{\text{RGB} \times \alpha}{255}
-$$
-
-- **Zero Copy DWM Presentation:** `UpdateLayeredWindow` passes the premultiplied DIB directly to the Windows Desktop Window Manager. DWM handles GPU composition at screen refresh rate.
+- **Grayscale Antialiasing & Luminance Alpha:** Text is drawn with `DrawTextW` (white text on a black surface) using `ANTIALIASED_QUALITY` to avoid ClearType color fringing on transparent backgrounds. Pixel alpha is derived directly from luminance.
+- **Adaptive Contrast Halo:** Automatically queries `SystemUsesLightTheme` in the Windows Personalize registry. Renders a soft 1-pixel contrast shadow behind the glyphs, guaranteeing readability on both pure black and bright translucent taskbars.
+- **Multi-Script GDI Font Fallback:** Standard GDI `DrawTextW` lacks modern Uniscribe/DirectWrite font linking. AeroSync-Lite classifies Unicode codepoints and dynamically selects the optimal system typeface:
+  - **Latin, Cyrillic, Greek:** `Segoe UI`
+  - **Indic (Malayalam, Devanagari, Tamil, etc.):** `Nirmala UI`
+  - **Thai, Lao, Khmer:** `Leelawadee UI`
+  - **Simplified Chinese:** `Microsoft YaHei UI`
+  - **Japanese:** `Yu Gothic UI`
+  - **Korean:** `Malgun Gothic`
+- **Premultiplication & Presentation:** Premultiplied BGRA buffers are uploaded to DWM via `UpdateLayeredWindow`.
 
 ### 4.5. Windows 11 Taskbar Docking & Z-Order Persistence
-Windows 11 restricts foreign processes from making `Shell_TrayWnd` a parent (`WS_CHILD`) or owner via cross-process UIPI controls.
+Windows 11 restricts foreign processes from making `Shell_TrayWnd` a parent (`WS_CHILD`) or owner via cross-process UIPI and modern XAML islands.
 
-AeroSync-Lite solves this via an autonomous floating topmost architecture:
-- **Window Styles:** `WS_POPUP | WS_VISIBLE` with `WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE`.
-- **Z-Order Pinning:**
-  1. `RegisterShellHookWindow` registers the overlay window to receive shell activation messages (`WM_SHELLHOOK`). Whenever another window or the taskbar is clicked, the overlay is immediately re-raised with `SetWindowPos(HWND_TOPMOST, SWP_NOACTIVATE)`.
-  2. `WM_WINDOWPOSCHANGING` intercepts any Z-order demotion, clearing `SWP_NOZORDER` and forcing `hwndInsertAfter = HWND_TOPMOST`.
-  3. `WM_MOUSEACTIVATE` returns `MA_NOACTIVATE` so clicking the play/pause button does not steal focus from your active workstation apps.
+AeroSync-Lite maintains continuous taskbar alignment without polling:
+- **WinEvent Foreground Hook:** `SetWinEventHook(EVENT_SYSTEM_FOREGROUND, ... WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS)` triggers instantaneous topmost re-raising only when foreground window focus changes.
+- **ShellHook Tracking:** `RegisterShellHookWindow` catches window destruction, creation, and taskbar activations.
+- **Z-Order Pinning:** `WM_WINDOWPOSCHANGING` intercepts any Z-order demotion, clearing `SWP_NOZORDER` and forcing `hwndInsertAfter = HWND_TOPMOST`.
+- **Explorer Restarts:** Listens for the registered `TaskbarCreated` window message to re-probe geometry and re-dock if `explorer.exe` restarts.
 
 ### 4.6. Multi-Tier Resilient Lyric Sourcing
 Lyrics are parsed from synchronized LRC formats using a multi-tiered fallback strategy:

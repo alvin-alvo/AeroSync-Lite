@@ -47,11 +47,14 @@ It docks directly in the empty space of your Windows taskbar, presenting the cur
 - 🪶 **True Zero-Polling Architecture:** Uses Windows Waitable High-Resolution Timers scheduled to the exact microsecond deadline of the *next* lyric line. While paused or idle, CPU consumption is strictly **0.00%**.
 - 🌐 **Zero Browser Extensions Required:** Hooks directly into the Windows System Media Transport Controls (SMTC) API. Automatically detects playback from YouTube Music running in Google Chrome, Microsoft Edge, Mozilla Firefox, Brave, or Opera.
 - 🎨 **Direct DWM Software Rendering:** Renders text and album art into a 32-bit ARGB Device-Independent Bitmap (DIB) with alpha derived from luminance, uploaded directly via `UpdateLayeredWindow`. Avoids GPU driver allocations entirely.
+- 🔤 **Multi-Script Unicode Typography:** Built-in dynamic font fallback supporting Latin (`Segoe UI`), Indic / Malayalam / Devanagari (`Nirmala UI`), Thai (`Leelawadee UI`), Simplified Chinese (`Microsoft YaHei UI`), Japanese (`Yu Gothic UI`), and Korean (`Malgun Gothic`).
+- 🌓 **Adaptive Light/Dark Theme Contrast:** Detects Windows taskbar color palette and renders a subtle contrast shadow halo, ensuring high readability over both dark and light transparent taskbars.
+- 🖼️ **Non-Destructive Album Art Retention:** Keeps validated artwork across track changes to eliminate placeholder flashes during Chrome metadata auto-advance, with WIC center-cropping for 16:9 thumbnails.
 - 🛡️ **Multi-Tier Resilient Lyric Sourcing:** Automatically fetches synced `.lrc` lyrics with multi-tier fallback:
   1. *Tier 1:* Direct exact match from **LRCLIB** (`/api/get`).
   2. *Tier 2:* Fuzzy duration search from **LRCLIB** (`/api/search`).
   3. *Tier 3:* Automatic fallback to **LRCMUX** aggregator (`api.lrcmux.dev`).
-- 📌 **Windows 11 Z-Order Pinning:** Employs `RegisterShellHookWindow` activation tracking and `WM_WINDOWPOSCHANGING` enforcement so the widget never disappears behind the taskbar when clicking other applications or Start menu.
+- 📌 **Windows 11 Z-Order Pinning:** Employs `SetWinEventHook` foreground tracking, `RegisterShellHookWindow`, and `WM_WINDOWPOSCHANGING` enforcement so the widget never disappears behind the taskbar when clicking other applications or Start menu.
 - ⏯️ **Interactive Media Control:** Left-clicking the square album thumbnail instantly toggles Play/Pause.
 - ⏱️ **Bluetooth & Audio Latency Compensation:** Right-click context menu enables adjusting lyric sync offset in real-time in ±100 ms steps.
 
@@ -123,7 +126,8 @@ AeroSync-Lite/
 │   ├── lyrics.rs           # Multi-tier WinHTTP client & fast LRC parser
 │   ├── render.rs           # 32-bit GDI software renderer & alpha composition
 │   ├── taskbar.rs          # Taskbar geometry measurement & docking logic
-│   └── art.rs              # WIC thumbnail decoder & corner-rounding mask
+│   ├── art.rs              # WIC thumbnail decoder & corner-rounding mask
+│   └── theme.rs            # Windows light/dark theme detection & contrast palette
 ├── Cargo.toml              # Minimal dependencies (windows crate only)
 ├── build.rs                # Application manifest embedding
 ├── manifest.xml            # Per-monitor DPI v2 & UAC configuration
